@@ -177,12 +177,12 @@ fn decoded_to_frame(f: &Vp9DecodedFrame, pts: Option<i64>) -> CoreResult<(PixelF
 pub struct Vp9Decoder {
     id: CodecId,
     seq: Vp9SequenceDecoder,
-    pending: VecDeque<Frame>,
+    /// Shown frames not yet returned, each with its [`Layout`].
+    pending: VecDeque<(Frame, Layout)>,
     flushed: bool,
-    /// The framework label of the most recently decoded frame's §7.2.2
-    /// format triple (`None` before the first decoded frame or after
-    /// [`Decoder::reset`]).
-    format: Option<PixelFormat>,
+    /// The [`Layout`] of the frame `receive_frame` last returned (`None`
+    /// before the first, and again after [`Decoder::reset`]).
+    last_output: Option<Layout>,
     /// The caller-granted threading budget (framework contract: serial
     /// until `set_execution_context` says otherwise); forwarded to the
     /// sequence decoder's §6.4 tile-column fan-out and preserved across
@@ -198,21 +198,21 @@ impl Vp9Decoder {
             seq: Vp9SequenceDecoder::new(),
             pending: VecDeque::new(),
             flushed: false,
-            format: None,
+            last_output: None,
             exec: ExecutionContext::serial(),
         }
     }
 
-    /// The framework pixel format the decoded stream is labelled with —
-    /// the §7.2.2 `(BitDepth, subsampling_x, subsampling_y)` triple of
-    /// the most recently decoded frame mapped onto the framework's
-    /// planar YUV families (4:2:0 / 4:2:2 / 4:4:4 / 4:4:0 at 8, 10 and
-    /// 12 bits). `None` until a frame has been decoded, and again after
-    /// [`Decoder::reset`].
-    pub fn pixel_format(&self) -> Option<PixelFormat> {
-        self.format
+    /// The frame last returned; before the first, the next queued one.
+    fn reported_layout(&self) -> Option<Layout> {
+        self.last_output
+            .or_else(|| self.pending.front().map(|(_, layout)| *layout))
     }
 }
+
+/// A shown frame's §7.2.3 frame size and the framework label of its
+/// §7.2.2 `(BitDepth, subsampling_x, subsampling_y)` triple.
+type Layout = ((u32, u32), PixelFormat);
 
 impl Default for Vp9Decoder {
     fn default() -> Self {
@@ -242,8 +242,8 @@ impl Decoder for Vp9Decoder {
         for payload in frames {
             if let Some(decoded) = self.seq.push_frame(payload).map_err(map_err)? {
                 let (fmt, frame) = decoded_to_frame(&decoded, packet.pts)?;
-                self.format = Some(fmt);
-                self.pending.push_back(frame);
+                self.pending
+                    .push_back((frame, ((decoded.width, decoded.height), fmt)));
             }
         }
         Ok(())
@@ -251,10 +251,24 @@ impl Decoder for Vp9Decoder {
 
     fn receive_frame(&mut self) -> CoreResult<Frame> {
         match self.pending.pop_front() {
-            Some(f) => Ok(f),
+            Some((f, layout)) => {
+                self.last_output = Some(layout);
+                Ok(f)
+            }
             None if self.flushed => Err(CoreError::Eof),
             None => Err(CoreError::NeedMore),
         }
+    }
+
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.reported_layout()
+            .map(|(size, _)| size)
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
+    /// The 4:2:0 / 4:2:2 / 4:4:4 / 4:4:0 label at 8, 10 or 12 bits.
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.reported_layout().map(|(_, format)| format)
     }
 
     fn flush(&mut self) -> CoreResult<()> {
@@ -276,7 +290,7 @@ impl Decoder for Vp9Decoder {
         self.seq.set_execution_context(&self.exec);
         self.pending.clear();
         self.flushed = false;
-        self.format = None;
+        self.last_output = None;
         Ok(())
     }
 }
