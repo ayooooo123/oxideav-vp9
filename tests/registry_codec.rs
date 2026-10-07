@@ -502,7 +502,11 @@ fn registry_decoder_matches_batch_decode_on_the_corpus() {
             last.subsampling_y,
         )
         .expect("every §7.2.2 triple has a framework label");
-        assert_eq!(dec.pixel_format(), Some(label), "{name}: decoder label");
+        assert_eq!(
+            dec.output_pixel_format(),
+            Some(label),
+            "{name}: decoder label"
+        );
         if !last.subsampling_x && last.subsampling_y {
             assert!(
                 matches!(
@@ -636,7 +640,11 @@ fn registry_pair_carries_440_at_every_depth() {
         let batch = oxideav_vp9::decode_vp9_sequence(&split).expect("batch decode");
         let mut dec = oxideav_vp9::Vp9Decoder::new();
         let decoded = decode_all(&mut dec, &packets);
-        assert_eq!(dec.pixel_format(), Some(fmt), "{fmt:?}: decoder label");
+        assert_eq!(
+            dec.output_pixel_format(),
+            Some(fmt),
+            "{fmt:?}: decoder label"
+        );
         assert_eq!(decoded.len(), batch.len());
         let bps = if depth == 8 { 1 } else { 2 };
         for (i, (v, b)) in decoded.iter().zip(&batch).enumerate() {
