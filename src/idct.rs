@@ -1052,4 +1052,182 @@ mod tests {
             assert_eq!(t, input, "WHT is not an involution at shift 0");
         }
     }
+
+    /// The §8.7.1.2 + §8.7.1.3 reference path: the copy-form permutation
+    /// followed by the recursive network. Production routes the DCT
+    /// passes through [`inverse_dct_fixed`]; this is the oracle the
+    /// differential tests below hold it to.
+    fn reference_dct_1d(t: &mut [i64], n: u32) {
+        idct_permute(t, n);
+        inverse_dct(t, n);
+    }
+
+    /// The production DCT entry must match the reference path bit for bit
+    /// on every transform size, on every input shape the decoder can feed
+    /// it (DC, single impulses at every index, flat, ramp) and over
+    /// thousands of pseudo-random coefficient vectors, including
+    /// magnitudes far past the `8 + BitDepth` conformance range. A wrong
+    /// index, angle, flip or reordered butterfly diverges immediately.
+    #[test]
+    fn fixed_dct_entry_matches_the_reference_bit_for_bit() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            let mut inputs: Vec<Vec<i64>> = vec![vec![0i64; n0]];
+            for dc in [1i64, -1, 4096, -4096, 1 << 20, -(1 << 20)] {
+                let mut v = vec![0i64; n0];
+                v[0] = dc;
+                inputs.push(v);
+            }
+            for k in 0..n0 {
+                for c in [1i64, -1, 4096, -(1 << 20)] {
+                    let mut v = vec![0i64; n0];
+                    v[k] = c;
+                    inputs.push(v);
+                }
+            }
+            inputs.push(
+                (0..n0)
+                    .map(|i| if i % 2 == 0 { 2048 } else { -2048 })
+                    .collect(),
+            );
+            inputs.push((0..n0).map(|i| i as i64 * 511 - 4096).collect());
+            for _ in 0..400 {
+                inputs.push((0..n0).map(|_| (next() % (1 << 21)) - (1 << 20)).collect());
+            }
+            for _ in 0..40 {
+                inputs.push((0..n0).map(|_| (next() % (1 << 28)) - (1 << 27)).collect());
+            }
+            for input in &inputs {
+                let mut fixed = input.clone();
+                inverse_dct_fixed(&mut fixed, n);
+                let mut reference = input.clone();
+                reference_dct_1d(&mut reference, n);
+                assert_eq!(fixed, reference, "n={n} input={input:?}");
+            }
+        }
+    }
+
+    /// The in-place bit reversal must equal the §8.7.1.2 copy-form
+    /// permutation, and (being a self-inverse permutation) restore the
+    /// input when applied twice.
+    #[test]
+    fn in_place_bit_reversal_matches_the_reference_permutation() {
+        let mut state: u64 = 0x0123_4567_89AB_CDEF;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            let input: Vec<i64> = (0..n0).map(|i| (i as i64) * 7 - 3 + (next() % 512)).collect();
+            let mut in_place = input.clone();
+            idct_bit_reverse_in_place(&mut in_place, n);
+            let mut reference = input.clone();
+            idct_permute(&mut reference, n);
+            assert_eq!(in_place, reference, "n={n}");
+            idct_bit_reverse_in_place(&mut in_place, n);
+            assert_eq!(in_place, input, "n={n}: the permutation is its own inverse");
+        }
+    }
+
+    /// [`inverse_transform_2d`] transcribed with every DCT pass routed
+    /// through [`reference_dct_1d`]: the oracle for the production
+    /// driver's fixed schedules and its stack scratch.
+    fn reference_inverse_transform_2d(dequant: &mut [i64], n: u32, tx_type: u8, lossless: bool) {
+        let n0 = 1usize << n;
+        let mut t = vec![0i64; n0];
+        for i in 0..n0 {
+            let base = i * n0;
+            t[..n0].copy_from_slice(&dequant[base..base + n0]);
+            if lossless {
+                inverse_wht(&mut t, 2);
+            } else {
+                let row_dct = tx_type == DCT_DCT || tx_type == ADST_DCT;
+                if row_dct {
+                    reference_dct_1d(&mut t, n);
+                } else {
+                    inverse_adst(&mut t, n);
+                }
+            }
+            dequant[base..base + n0].copy_from_slice(&t[..n0]);
+        }
+        for j in 0..n0 {
+            for i in 0..n0 {
+                t[i] = dequant[i * n0 + j];
+            }
+            if lossless {
+                inverse_wht(&mut t, 0);
+            } else {
+                let col_dct = tx_type == DCT_DCT || tx_type == DCT_ADST;
+                if col_dct {
+                    reference_dct_1d(&mut t, n);
+                } else {
+                    inverse_adst(&mut t, n);
+                }
+            }
+            if lossless {
+                for i in 0..n0 {
+                    dequant[i * n0 + j] = t[i];
+                }
+            } else {
+                let shift = core::cmp::min(6, n + 2);
+                for i in 0..n0 {
+                    dequant[i * n0 + j] = round2(t[i], shift);
+                }
+            }
+        }
+    }
+
+    /// The production 2D driver — every `TxType`, the lossless WHT path
+    /// and the `Round2( T[ i ], Min( 6, n + 2 ) )` column rounding — must
+    /// stay bit-identical to the reference driver over random blocks at
+    /// every size the decoder uses.
+    #[test]
+    fn transform_2d_matches_the_reference_driver() {
+        let mut state: u64 = 0xA5A5_1234_5678_9ABC;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        let mut check = |n: u32, tx_type: u8, lossless: bool, mag: i64| {
+            let n0 = 1usize << n;
+            let mut reference: Vec<i64> =
+                (0..n0 * n0).map(|_| (next() % (2 * mag + 1)) - mag).collect();
+            let mut produced = reference.clone();
+            inverse_transform_2d(&mut produced, n, tx_type, lossless);
+            reference_inverse_transform_2d(&mut reference, n, tx_type, lossless);
+            assert_eq!(
+                produced, reference,
+                "n={n} tx_type={tx_type} lossless={lossless}"
+            );
+        };
+        for tx_type in [DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+            // The ADST sizes the §8.7.1.9 dispatcher defines.
+            for n in 2..=4u32 {
+                for _ in 0..32 {
+                    check(n, tx_type, false, 4096);
+                }
+            }
+        }
+        for n in 2..=5u32 {
+            for _ in 0..32 {
+                check(n, DCT_DCT, false, 1 << 20);
+            }
+            // The lossless (WHT) path, as the reconstruct driver gates it.
+            for _ in 0..32 {
+                check(n, DCT_DCT, true, 4096);
+            }
+        }
+    }
 }
