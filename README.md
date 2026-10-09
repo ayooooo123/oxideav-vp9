@@ -993,6 +993,13 @@ scratch. Every active buffer prefix is overwritten before use. Differential
 tests retain the recursive DCT and generic convolution as independent
 references for these paths.
 
+Unscaled inter prediction omits a convolution axis when its phase is zero.
+The horizontal stage still clips before vertical filtering; reference-edge
+clamping and scaled-reference filtering are unchanged. Axis-phase
+differentials cover all four kernels at 8, 10 and 12 bits, including clipped
+borders. This optimization does not imply that the HD decode-speed floor
+has been met.
+
 ## Provenance
 
 Single source of truth: the VP9 Bitstream & Decoding Process
