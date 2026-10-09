@@ -327,18 +327,31 @@ pub(crate) fn block_inter_predict_plane(
 
         let taps_x = &filter[phase_x];
         let taps_y = &filter[phase_y];
-        let intermediate_height = h + 7;
+        // Phase zero is identity: omit that axis rather than multiplying
+        // seven zero taps. Keep the horizontal clipping before a vertical pass.
+        let horizontal_height = if phase_y == 0 { h } else { h + 7 };
+        let needed = horizontal_height * w;
+        let horizontal = if phase_y == 0 {
+            &mut *pred
+        } else {
+            if intermediate.len() < needed {
+                intermediate.resize(needed, 0);
+            }
+            &mut intermediate[..needed]
+        };
+        let row_offset = if phase_y == 0 { 0 } else { 3 };
 
-        let needed = intermediate_height * w;
-        if intermediate.len() < needed {
-            intermediate.resize(needed, 0);
-        }
-        let intermediate = &mut intermediate[..needed];
-
-        for r in 0..intermediate_height {
-            let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - 3) as usize;
+        for r in 0..horizontal_height {
+            let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - row_offset) as usize;
             let row = &samples[ref_row * stride..ref_row * stride + (last_x as usize + 1)];
-            let out = &mut intermediate[r * w..(r + 1) * w];
+            let out = &mut horizontal[r * w..(r + 1) * w];
+            if phase_x == 0 {
+                for (c, slot) in out.iter_mut().enumerate() {
+                    let ref_col = clip3(0, last_x, (x >> 4) + c as i32) as usize;
+                    *slot = clip1(row[ref_col], bit_depth);
+                }
+                continue;
+            }
             let base_col_start = (x >> 4) - 3;
 
             for (c, slot) in out.iter_mut().enumerate() {
@@ -357,6 +370,10 @@ pub(crate) fn block_inter_predict_plane(
                 }
                 *slot = clip1(round2(s, 7), bit_depth);
             }
+        }
+
+        if phase_y == 0 {
+            return;
         }
 
         for r in 0..h {
