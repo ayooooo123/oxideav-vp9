@@ -985,6 +985,14 @@ chain from 31.3 to 43.3 fps and the keyframe from 20.4 to 33.9 fps on
 the development machine; the sub-pel refinement's §8.5.2 prediction
 remains the dominant cost.
 
+Decoder DCTs use fixed 4/8/16/32-point schedules built from the existing
+butterfly network, with in-place bit reversal and bounded stack scratch.
+Inter prediction reuses grow-only prediction and convolution buffers per
+decoder tile; encoder leaf loops and motion-search candidates also reuse
+scratch. Every active buffer prefix is overwritten before use. Differential
+tests retain the recursive DCT and generic convolution as independent
+references for these paths.
+
 ## Provenance
 
 Single source of truth: the VP9 Bitstream & Decoding Process
