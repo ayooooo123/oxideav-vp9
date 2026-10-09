@@ -441,6 +441,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adjacent_columns_match_scalar_across_phases_and_tails() {
+        let (width, height, stride) = (43usize, 27usize, 49usize);
+        let mut intermediate = Vec::new();
+        let mut output = Vec::new();
+        let cases = [
+            (1, 3, 7, 8),
+            (3, 5, -4, -2),
+            (4, 7, 7, 8),
+            (5, 2, 39, 24),
+            (7, 4, -2, 6),
+            (8, 6, 32, 23),
+            (9, 5, 0, -3),
+            (16, 8, 11, 9),
+            (31, 3, 1, 27),
+        ];
+        for bit_depth in [8, 10, 12] {
+            let mask = (1 << bit_depth) - 1;
+            let samples: Vec<i32> = (0..stride * height)
+                .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 17) as i32 & mask)
+                .collect();
+            for filter in 0..4 {
+                for phase_x in 0..16 {
+                    for phase_y in 0..16 {
+                        for &(w, h, origin_x, origin_y) in &cases {
+                            let x = origin_x * 16 + phase_x;
+                            let y = origin_y * 16 + phase_y;
+                            let expected = block_inter_predict(
+                                |r, c| samples[r as usize * stride + c as usize],
+                                x, y, 16, 16, w, h, filter,
+                                width as i32 - 1, height as i32 - 1, bit_depth,
+                            );
+                            block_inter_predict_plane(
+                                &samples, stride, x, y, 16, 16, w, h, filter,
+                                width as i32 - 1, height as i32 - 1, bit_depth,
+                                &mut intermediate, &mut output,
+                            );
+                            assert_eq!(
+                                expected.as_slice(), &output[..w * h],
+                                "depth {bit_depth}, filter {filter}, phase ({phase_x},{phase_y}), \
+                                 origin ({origin_x},{origin_y}), shape {w}x{h}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn identity_axes_match_generic_for_all_phases_and_clipped_edges() {
         let (width, height, stride) = (41usize, 29usize, 48usize);
         let mut intermediate = Vec::new();
