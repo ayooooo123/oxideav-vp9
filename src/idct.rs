@@ -10,8 +10,11 @@
 //!   `SH` (Hadamard rotation + rounding out of `S`) — together with the
 //!   `cos64` / `sin64` angle functions backed by the verbatim 33-entry
 //!   [`COS64_LOOKUP`] table and the `brev` bit-reversal helper.
-//! * The §8.7.1.2 inverse-DCT array permutation and the recursive
-//!   §8.7.1.3 inverse DCT process ([`inverse_dct`]) for `2 <= n <= 5`.
+//! * The §8.7.1.2 inverse-DCT array permutation — applied in place as
+//!   bit-reversal swaps — and the §8.7.1.3 inverse DCT executed as one
+//!   fixed schedule per size ([`inverse_dct_fixed`], `2 <= n <= 5`). The
+//!   recursive network and the copy-form permutation are retained under
+//!   `#[cfg(test)]` as the differential oracle.
 //! * The §8.7.1.4 / §8.7.1.5 ADST input/output permutations and the
 //!   §8.7.1.6 / §8.7.1.7 / §8.7.1.8 ADST4 / ADST8 / ADST16 processes
 //!   dispatched by the §8.7.1.9 [`inverse_adst`] for `2 <= n <= 4`.
@@ -106,6 +109,11 @@ pub(crate) fn sin64(angle: i32) -> i64 {
 /// §8.7.1.1 butterfly rotation `B( a, b, angle, flip )` over the array
 /// `t`. When `angle == 16 + 32*k` the two-multiply fast path is used.
 /// `flip == true` exchanges `t[a]` and `t[b]` afterwards.
+///
+/// The fixed schedules below call this with literal angles, flips and
+/// indices; `#[inline(always)]` puts those literals in front of the
+/// rotation so its branch and the `cos64` / `sin64` lookups fold away.
+#[inline(always)]
 fn butterfly(t: &mut [i64], a: usize, b: usize, angle: i32, flip: bool) {
     // §8.7.1.1: the `16 + 32*k` fast path applies when (angle & 31) == 16.
     if (angle & 31) == 16 {
@@ -132,6 +140,10 @@ fn butterfly(t: &mut [i64], a: usize, b: usize, angle: i32, flip: bool) {
 
 /// §8.7.1.1 Hadamard rotation `H( a, b, flip )` over the array `t`.
 /// `flip == true` is specified as `H( b, a, 0 )`.
+///
+/// `#[inline(always)]` for the same reason as [`butterfly`]: the fixed
+/// schedules pass the flip as a literal, so the swap folds away.
+#[inline(always)]
 fn hadamard(t: &mut [i64], a: usize, b: usize, flip: bool) {
     let (a, b) = if flip { (b, a) } else { (a, b) };
     let x = t[a];
@@ -158,6 +170,11 @@ fn sh(t: &mut [i64], s: &[i64], a: usize, b: usize) {
 }
 
 /// §8.7.1.2 inverse-DCT array permutation: `T[i] = copyT[ brev(n, i) ]`.
+///
+/// Reference only: production reverses the bits in place
+/// ([`idct_bit_reverse_in_place`]); the tests keep this copy form as the
+/// differential oracle for it.
+#[cfg(test)]
 fn idct_permute(t: &mut [i64], n: u32) {
     let len = 1usize << n;
     let copy_t: Vec<i64> = t[..len].to_vec();
@@ -168,6 +185,11 @@ fn idct_permute(t: &mut [i64], n: u32) {
 
 /// §8.7.1.3 inverse DCT process over the (already-permuted) array `t`
 /// of length `1<<n` for `2 <= n <= 5`. Recursive per the spec.
+///
+/// Reference only: production runs the per-size fixed schedules
+/// ([`fixed_idct4`] .. [`fixed_idct32`]); the tests keep this recursive
+/// form as the differential oracle for them.
+#[cfg(test)]
 fn inverse_dct(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
     let n1 = 1usize << (n - 1);
@@ -254,12 +276,280 @@ fn inverse_dct(t: &mut [i64], n: u32) {
     }
 }
 
+/// §8.7.1.2 inverse-DCT array permutation applied in place: the same
+/// `T[ i ] = copyT[ brev( n, i ) ]` the listing describes, realised as
+/// the transpositions of the (self-inverse) bit-reversal permutation so
+/// no copy of the array is needed.
+fn idct_bit_reverse_in_place(t: &mut [i64], n: u32) {
+    let len = 1usize << n;
+    for i in 0..len {
+        let j = brev(n, i);
+        if j > i {
+            t.swap(i, j);
+        }
+    }
+}
+
+/// The production §8.7.1.2 + §8.7.1.3 inverse DCT entry: reverse the bits
+/// of `t[..1 << n]` in place, then run the `1 << n`-point inverse DCT as
+/// the fixed schedule for that size. Takes the un-permuted coefficient
+/// vector and leaves the spatial-domain output, exactly as the
+/// [`idct_permute`] + [`inverse_dct`] pair it replaces; the differential
+/// tests hold the two to bit equality. `n` is `2..=5` (4- to 32-point),
+/// the only sizes the transform driver derives from `TxSize`.
+fn inverse_dct_fixed(t: &mut [i64], n: u32) {
+    idct_bit_reverse_in_place(t, n);
+    match n {
+        2 => fixed_idct4(t),
+        3 => fixed_idct8(t),
+        4 => fixed_idct16(t),
+        _ => fixed_idct32(t),
+    }
+}
+
+/// §8.7.1.3 inverse DCT for `n == 2` (4-point) as a fixed schedule: the
+/// same butterflies and Hadamard rotations, in the same order, with every angle
+/// expression from the generic path above resolved at compile time — no
+/// recursion, no `brev` call and no `cos64` / `sin64` lookup left at run time.
+/// The caller has already applied the §8.7.1.2 bit reversal in place.
+#[inline(always)]
+fn fixed_idct4(t: &mut [i64]) {
+    // step 1: B(0, 1, 16, 1)
+    butterfly(t, 0, 1, 16, true);
+    // step 2 i=0: B(2, 3, 24, 0)
+    butterfly(t, 2, 3, 24, false);
+    // step 7 i=0: H(0, 3, 0)
+    hadamard(t, 0, 3, false);
+    // step 7 i=1: H(1, 2, 0)
+    hadamard(t, 1, 2, false);
+}
+
+/// §8.7.1.3 inverse DCT for `n == 3` (8-point) as a fixed schedule: the
+/// same butterflies and Hadamard rotations, in the same order, with every angle
+/// expression from the generic path above resolved at compile time — no
+/// recursion, no `brev` call and no `cos64` / `sin64` lookup left at run time.
+/// The caller has already applied the §8.7.1.2 bit reversal in place.
+#[inline(always)]
+fn fixed_idct8(t: &mut [i64]) {
+    fixed_idct4(t);
+    // step 2 i=0: B(4, 7, 28, 0)
+    butterfly(t, 4, 7, 28, false);
+    // step 2 i=1: B(5, 6, 12, 0)
+    butterfly(t, 5, 6, 12, false);
+    // step 3 i=0 j=0: H(4, 5, 0)
+    hadamard(t, 4, 5, false);
+    // step 3 i=0 j=1: H(6, 7, 1)
+    hadamard(t, 6, 7, true);
+    // step 6 i=0: B(6, 5, 16, 1)
+    butterfly(t, 6, 5, 16, true);
+    // step 7 i=0: H(0, 7, 0)
+    hadamard(t, 0, 7, false);
+    // step 7 i=1: H(1, 6, 0)
+    hadamard(t, 1, 6, false);
+    // step 7 i=2: H(2, 5, 0)
+    hadamard(t, 2, 5, false);
+    // step 7 i=3: H(3, 4, 0)
+    hadamard(t, 3, 4, false);
+}
+
+/// §8.7.1.3 inverse DCT for `n == 4` (16-point) as a fixed schedule: the
+/// same butterflies and Hadamard rotations, in the same order, with every angle
+/// expression from the generic path above resolved at compile time — no
+/// recursion, no `brev` call and no `cos64` / `sin64` lookup left at run time.
+/// The caller has already applied the §8.7.1.2 bit reversal in place.
+#[inline(always)]
+fn fixed_idct16(t: &mut [i64]) {
+    fixed_idct8(t);
+    // step 2 i=0: B(8, 15, 30, 0)
+    butterfly(t, 8, 15, 30, false);
+    // step 2 i=1: B(9, 14, 14, 0)
+    butterfly(t, 9, 14, 14, false);
+    // step 2 i=2: B(10, 13, 22, 0)
+    butterfly(t, 10, 13, 22, false);
+    // step 2 i=3: B(11, 12, 6, 0)
+    butterfly(t, 11, 12, 6, false);
+    // step 3 i=0 j=0: H(8, 9, 0)
+    hadamard(t, 8, 9, false);
+    // step 3 i=0 j=1: H(10, 11, 1)
+    hadamard(t, 10, 11, true);
+    // step 3 i=1 j=0: H(12, 13, 0)
+    hadamard(t, 12, 13, false);
+    // step 3 i=1 j=1: H(14, 15, 1)
+    hadamard(t, 14, 15, true);
+    // step 5a i=0 j=0: B(14, 9, 24, 1)
+    butterfly(t, 14, 9, 24, true);
+    // step 5a i=0 j=1: B(10, 13, 72, 1)
+    butterfly(t, 10, 13, 72, true);
+    // step 5b i=0 j=0: H(8, 11, 0)
+    hadamard(t, 8, 11, false);
+    // step 5b i=0 j=1: H(12, 15, 1)
+    hadamard(t, 12, 15, true);
+    // step 5b i=1 j=0: H(9, 10, 0)
+    hadamard(t, 9, 10, false);
+    // step 5b i=1 j=1: H(13, 14, 1)
+    hadamard(t, 13, 14, true);
+    // step 6 i=0: B(13, 10, 16, 1)
+    butterfly(t, 13, 10, 16, true);
+    // step 6 i=1: B(12, 11, 16, 1)
+    butterfly(t, 12, 11, 16, true);
+    // step 7 i=0: H(0, 15, 0)
+    hadamard(t, 0, 15, false);
+    // step 7 i=1: H(1, 14, 0)
+    hadamard(t, 1, 14, false);
+    // step 7 i=2: H(2, 13, 0)
+    hadamard(t, 2, 13, false);
+    // step 7 i=3: H(3, 12, 0)
+    hadamard(t, 3, 12, false);
+    // step 7 i=4: H(4, 11, 0)
+    hadamard(t, 4, 11, false);
+    // step 7 i=5: H(5, 10, 0)
+    hadamard(t, 5, 10, false);
+    // step 7 i=6: H(6, 9, 0)
+    hadamard(t, 6, 9, false);
+    // step 7 i=7: H(7, 8, 0)
+    hadamard(t, 7, 8, false);
+}
+
+/// §8.7.1.3 inverse DCT for `n == 5` (32-point) as a fixed schedule: the
+/// same butterflies and Hadamard rotations, in the same order, with every angle
+/// expression from the generic path above resolved at compile time — no
+/// recursion, no `brev` call and no `cos64` / `sin64` lookup left at run time.
+/// The caller has already applied the §8.7.1.2 bit reversal in place.
+#[inline(always)]
+fn fixed_idct32(t: &mut [i64]) {
+    fixed_idct16(t);
+    // step 2 i=0: B(16, 31, 31, 0)
+    butterfly(t, 16, 31, 31, false);
+    // step 2 i=1: B(17, 30, 15, 0)
+    butterfly(t, 17, 30, 15, false);
+    // step 2 i=2: B(18, 29, 23, 0)
+    butterfly(t, 18, 29, 23, false);
+    // step 2 i=3: B(19, 28, 7, 0)
+    butterfly(t, 19, 28, 7, false);
+    // step 2 i=4: B(20, 27, 27, 0)
+    butterfly(t, 20, 27, 27, false);
+    // step 2 i=5: B(21, 26, 11, 0)
+    butterfly(t, 21, 26, 11, false);
+    // step 2 i=6: B(22, 25, 19, 0)
+    butterfly(t, 22, 25, 19, false);
+    // step 2 i=7: B(23, 24, 3, 0)
+    butterfly(t, 23, 24, 3, false);
+    // step 3 i=0 j=0: H(16, 17, 0)
+    hadamard(t, 16, 17, false);
+    // step 3 i=0 j=1: H(18, 19, 1)
+    hadamard(t, 18, 19, true);
+    // step 3 i=1 j=0: H(20, 21, 0)
+    hadamard(t, 20, 21, false);
+    // step 3 i=1 j=1: H(22, 23, 1)
+    hadamard(t, 22, 23, true);
+    // step 3 i=2 j=0: H(24, 25, 0)
+    hadamard(t, 24, 25, false);
+    // step 3 i=2 j=1: H(26, 27, 1)
+    hadamard(t, 26, 27, true);
+    // step 3 i=3 j=0: H(28, 29, 0)
+    hadamard(t, 28, 29, false);
+    // step 3 i=3 j=1: H(30, 31, 1)
+    hadamard(t, 30, 31, true);
+    // step 4a i=0 j=0: B(30, 17, 28, 1)
+    butterfly(t, 30, 17, 28, true);
+    // step 4a i=0 j=1: B(22, 25, 84, 1)
+    butterfly(t, 22, 25, 84, true);
+    // step 4a i=1 j=0: B(26, 21, 12, 1)
+    butterfly(t, 26, 21, 12, true);
+    // step 4a i=1 j=1: B(18, 29, 68, 1)
+    butterfly(t, 18, 29, 68, true);
+    // step 4b i=0 j=0: H(16, 19, 0)
+    hadamard(t, 16, 19, false);
+    // step 4b i=0 j=1: H(20, 23, 1)
+    hadamard(t, 20, 23, true);
+    // step 4b i=0 j=2: H(24, 27, 0)
+    hadamard(t, 24, 27, false);
+    // step 4b i=0 j=3: H(28, 31, 1)
+    hadamard(t, 28, 31, true);
+    // step 4b i=1 j=0: H(17, 18, 0)
+    hadamard(t, 17, 18, false);
+    // step 4b i=1 j=1: H(21, 22, 1)
+    hadamard(t, 21, 22, true);
+    // step 4b i=1 j=2: H(25, 26, 0)
+    hadamard(t, 25, 26, false);
+    // step 4b i=1 j=3: H(29, 30, 1)
+    hadamard(t, 29, 30, true);
+    // step 5a i=0 j=0: B(29, 18, 24, 1)
+    butterfly(t, 29, 18, 24, true);
+    // step 5a i=0 j=1: B(21, 26, 72, 1)
+    butterfly(t, 21, 26, 72, true);
+    // step 5a i=1 j=0: B(28, 19, 24, 1)
+    butterfly(t, 28, 19, 24, true);
+    // step 5a i=1 j=1: B(20, 27, 72, 1)
+    butterfly(t, 20, 27, 72, true);
+    // step 5b i=0 j=0: H(16, 23, 0)
+    hadamard(t, 16, 23, false);
+    // step 5b i=0 j=1: H(24, 31, 1)
+    hadamard(t, 24, 31, true);
+    // step 5b i=1 j=0: H(17, 22, 0)
+    hadamard(t, 17, 22, false);
+    // step 5b i=1 j=1: H(25, 30, 1)
+    hadamard(t, 25, 30, true);
+    // step 5b i=2 j=0: H(18, 21, 0)
+    hadamard(t, 18, 21, false);
+    // step 5b i=2 j=1: H(26, 29, 1)
+    hadamard(t, 26, 29, true);
+    // step 5b i=3 j=0: H(19, 20, 0)
+    hadamard(t, 19, 20, false);
+    // step 5b i=3 j=1: H(27, 28, 1)
+    hadamard(t, 27, 28, true);
+    // step 6 i=0: B(27, 20, 16, 1)
+    butterfly(t, 27, 20, 16, true);
+    // step 6 i=1: B(26, 21, 16, 1)
+    butterfly(t, 26, 21, 16, true);
+    // step 6 i=2: B(25, 22, 16, 1)
+    butterfly(t, 25, 22, 16, true);
+    // step 6 i=3: B(24, 23, 16, 1)
+    butterfly(t, 24, 23, 16, true);
+    // step 7 i=0: H(0, 31, 0)
+    hadamard(t, 0, 31, false);
+    // step 7 i=1: H(1, 30, 0)
+    hadamard(t, 1, 30, false);
+    // step 7 i=2: H(2, 29, 0)
+    hadamard(t, 2, 29, false);
+    // step 7 i=3: H(3, 28, 0)
+    hadamard(t, 3, 28, false);
+    // step 7 i=4: H(4, 27, 0)
+    hadamard(t, 4, 27, false);
+    // step 7 i=5: H(5, 26, 0)
+    hadamard(t, 5, 26, false);
+    // step 7 i=6: H(6, 25, 0)
+    hadamard(t, 6, 25, false);
+    // step 7 i=7: H(7, 24, 0)
+    hadamard(t, 7, 24, false);
+    // step 7 i=8: H(8, 23, 0)
+    hadamard(t, 8, 23, false);
+    // step 7 i=9: H(9, 22, 0)
+    hadamard(t, 9, 22, false);
+    // step 7 i=10: H(10, 21, 0)
+    hadamard(t, 10, 21, false);
+    // step 7 i=11: H(11, 20, 0)
+    hadamard(t, 11, 20, false);
+    // step 7 i=12: H(12, 19, 0)
+    hadamard(t, 12, 19, false);
+    // step 7 i=13: H(13, 18, 0)
+    hadamard(t, 13, 18, false);
+    // step 7 i=14: H(14, 17, 0)
+    hadamard(t, 14, 17, false);
+    // step 7 i=15: H(15, 16, 0)
+    hadamard(t, 15, 16, false);
+}
+
 /// §8.7.1.4 inverse ADST input array permutation over `t` of length
-/// `1<<n`.
+/// `1<<n`. The permutation source is a bounded stack copy (`n <= 4`, so
+/// at most 16 active entries): no heap allocation per call, and the
+/// read-while-writing order of the listing is unchanged.
 fn adst_input_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
     let n1 = 1usize << (n - 1);
-    let copy_t: Vec<i64> = t[..n0].to_vec();
+    let mut scratch = [0i64; 32];
+    let copy_t = &mut scratch[..n0];
+    copy_t.copy_from_slice(&t[..n0]);
     for i in 0..n1 {
         t[2 * i] = copy_t[n0 - 1 - 2 * i];
         t[2 * i + 1] = copy_t[2 * i];
@@ -267,10 +557,13 @@ fn adst_input_permute(t: &mut [i64], n: u32) {
 }
 
 /// §8.7.1.5 inverse ADST output array permutation over `t` of length
-/// `1<<n` for `n` in `{3, 4}`.
+/// `1<<n` for `n` in `{3, 4}`. Bounded stack copy, as
+/// [`adst_input_permute`].
 fn adst_output_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
-    let copy_t: Vec<i64> = t[..n0].to_vec();
+    let mut scratch = [0i64; 32];
+    let copy_t = &mut scratch[..n0];
+    copy_t.copy_from_slice(&t[..n0]);
     if n == 4 {
         for a in 0..2usize {
             for b in 0..2usize {
@@ -478,8 +771,7 @@ pub(crate) fn inverse_wht(t: &mut [i64], shift: u32) {
 /// runs the ADST.
 fn apply_1d(t: &mut [i64], n: u32, use_dct: bool) {
     if use_dct {
-        idct_permute(t, n);
-        inverse_dct(t, n);
+        inverse_dct_fixed(t, n);
     } else {
         inverse_adst(t, n);
     }
@@ -496,18 +788,22 @@ fn apply_1d(t: &mut [i64], n: u32, use_dct: bool) {
 /// On return `dequant` holds the spatial-domain residual.
 pub(crate) fn inverse_transform_2d(dequant: &mut [i64], n: u32, tx_type: u8, lossless: bool) {
     let n0 = 1usize << n;
-    let mut t = vec![0i64; n0];
+    // `n <= 5` (32x32 is the largest VP9 transform), so the pass scratch
+    // is a bounded stack buffer holding exactly the active slice, not a
+    // heap allocation per transform.
+    let mut scratch = [0i64; 32];
+    let t = &mut scratch[..n0];
 
     // Row transforms (i = 0..n0-1).
     for i in 0..n0 {
         let base = i * n0;
         t[..n0].copy_from_slice(&dequant[base..base + n0]);
         if lossless {
-            inverse_wht(&mut t, 2);
+            inverse_wht(&mut *t, 2);
         } else {
             // Row uses DCT when TxType is DCT_DCT or ADST_DCT.
             let row_dct = tx_type == DCT_DCT || tx_type == ADST_DCT;
-            apply_1d(&mut t, n, row_dct);
+            apply_1d(&mut *t, n, row_dct);
         }
         dequant[base..base + n0].copy_from_slice(&t[..n0]);
     }
@@ -518,11 +814,11 @@ pub(crate) fn inverse_transform_2d(dequant: &mut [i64], n: u32, tx_type: u8, los
             t[i] = dequant[i * n0 + j];
         }
         if lossless {
-            inverse_wht(&mut t, 0);
+            inverse_wht(&mut *t, 0);
         } else {
             // Column uses DCT when TxType is DCT_DCT or DCT_ADST.
             let col_dct = tx_type == DCT_DCT || tx_type == DCT_ADST;
-            apply_1d(&mut t, n, col_dct);
+            apply_1d(&mut *t, n, col_dct);
         }
         if lossless {
             for i in 0..n0 {
