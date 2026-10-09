@@ -45,7 +45,7 @@ use crate::header::{
 };
 use crate::idct::DCT_DCT;
 use crate::inter_mv::{BlockGrid, ScaleGeom};
-use crate::inter_pred::{predict_inter, InterPredArgs, RefPlane, RefPlanes};
+use crate::inter_pred::{predict_inter, InterPredArgs, InterPredScratch, RefPlane, RefPlanes};
 use crate::intra::{predict_intra, Plane, PredMode};
 use crate::reconstruct::reconstruct_block;
 use crate::residual::{
@@ -2123,6 +2123,7 @@ fn predict_inter_leaf2_scaled(
     let num8x8w = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
     let num8x8h = u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize]);
     let block_mvs = [[mv[0]; 4], [mv[1]; 4]];
+    let mut prediction_scratch = InterPredScratch::default();
     for (plane, pred_plane) in pred.iter_mut().enumerate() {
         let sub_x = plane > 0 && ssx;
         let sub_y = plane > 0 && ssy;
@@ -2177,7 +2178,10 @@ fn predict_inter_leaf2_scaled(
             bit_depth,
             is_compound: second.is_some(),
         };
-        predict_inter(pred_plane, &args, &grid, &geom, &block_mvs, &refs, ssx, ssy);
+        predict_inter(
+            pred_plane, &args, &grid, &geom, &block_mvs, &refs, ssx, ssy,
+            &mut prediction_scratch,
+        );
     }
 }
 
@@ -2209,6 +2213,7 @@ fn predict_inter_leaf_sub8x8(
     interp_filter: u8,
 ) {
     debug_assert!(mi_size < BLOCK_8X8);
+    let mut prediction_scratch = InterPredScratch::default();
     for (plane, pred_plane) in pred.iter_mut().enumerate() {
         let sub_x = plane > 0 && ssx;
         let sub_y = plane > 0 && ssy;
@@ -2268,7 +2273,10 @@ fn predict_inter_leaf_sub8x8(
                     bit_depth,
                     is_compound: second.is_some(),
                 };
-                predict_inter(pred_plane, &args, &grid, &geom, block_mvs, &refs, ssx, ssy);
+                predict_inter(
+                    pred_plane, &args, &grid, &geom, block_mvs, &refs, ssx, ssy,
+                    &mut prediction_scratch,
+                );
             }
         }
     }
@@ -2603,6 +2611,7 @@ fn refine_leaf_mv_subpel(
     let region_h = (num8x8h * 8) as usize;
 
     let (samples, stride) = reference[0];
+    let mut prediction_scratch = InterPredScratch::default();
     let sad_of = |mv: [i32; 2]| -> u64 {
         let block_mvs = [[mv; 4], [[0i32; 2]; 4]];
         let refs = RefPlanes {
@@ -2644,6 +2653,7 @@ fn refine_leaf_mv_subpel(
         };
         predict_inter(
             scratch, &args, &grid, &geom, &block_mvs, &refs, false, false,
+            &mut prediction_scratch,
         );
         let mut sad = 0u64;
         for i in 0..region_h {

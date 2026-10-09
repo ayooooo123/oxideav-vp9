@@ -136,6 +136,13 @@ pub(crate) struct InterPredArgs {
     pub is_compound: bool,
 }
 
+/// Prediction storage reused across blocks; only newly grown cells are initialized.
+#[derive(Default)]
+pub(crate) struct InterPredScratch {
+    preds: [Vec<i32>; 2],
+    intermediate: Vec<i32>,
+}
+
 /// Run the §8.5.2 inter prediction process for one region of one
 /// plane, writing the predicted samples into `dst`.
 ///
@@ -160,11 +167,11 @@ pub(crate) fn predict_inter(
     refs: &RefPlanes<'_>,
     subsampling_x: bool,
     subsampling_y: bool,
+    scratch: &mut InterPredScratch,
 ) {
     let n_lists = if args.is_compound { 2 } else { 1 };
 
-    // preds[ refList ] — each a flattened w×h prediction block.
-    let mut preds: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+    let InterPredScratch { preds, intermediate } = scratch;
 
     for (ref_list, pred_slot) in preds.iter_mut().enumerate().take(n_lists) {
         let ref_plane = refs.list[ref_list].expect("missing reference plane for active refList");
@@ -211,7 +218,7 @@ pub(crate) fn predict_inter(
         let last_y = ((ref_plane.ref_frame_height + sub_y as i32) >> sub_y) - 1;
 
         // §8.5.2 step 5 — §8.5.2.4 block inter prediction.
-        *pred_slot = crate::block_inter_pred::block_inter_predict_plane(
+        crate::block_inter_pred::block_inter_predict_plane(
             ref_plane.samples,
             ref_plane.stride,
             scaled.start_x,
@@ -224,6 +231,8 @@ pub(crate) fn predict_inter(
             last_x,
             last_y,
             args.bit_depth,
+            intermediate,
+            pred_slot,
         );
     }
 
@@ -424,6 +433,7 @@ mod tests {
         let block_mvs = [[[0, 0]; 4]; 2];
         predict_inter(
             &mut dst, &args, &grid, &geom, &block_mvs, &refs, false, false,
+            &mut InterPredScratch::default(),
         );
 
         for i in 0..8 {
@@ -486,6 +496,7 @@ mod tests {
         };
         predict_inter(
             &mut dst, &args, &grid, &geom, &block_mvs, &refs, false, false,
+            &mut InterPredScratch::default(),
         );
 
         for i in 0..8 {
@@ -552,6 +563,7 @@ mod tests {
         let block_mvs = [[[0, 0]; 4]; 2];
         predict_inter(
             &mut dst, &args, &grid, &geom, &block_mvs, &refs, false, false,
+            &mut InterPredScratch::default(),
         );
 
         // Round2( 100 + 151, 1 ) = (251 + 1) >> 1 = 126.
@@ -613,6 +625,7 @@ mod tests {
         };
         predict_inter(
             &mut dst, &args, &grid, &geom, &block_mvs, &refs, false, false,
+            &mut InterPredScratch::default(),
         );
 
         for i in 0..16 {
@@ -671,7 +684,10 @@ mod tests {
                 None,
             ],
         };
-        predict_inter(&mut dst, &args, &grid, &geom, &block_mvs, &refs, true, true);
+        predict_inter(
+            &mut dst, &args, &grid, &geom, &block_mvs, &refs, true, true,
+            &mut InterPredScratch::default(),
+        );
 
         for i in 0..8 {
             for j in 0..8 {
@@ -821,6 +837,7 @@ mod tests {
         let mut dst = Plane::new(64, 64);
         predict_inter(
             &mut dst, &args, &grid, &geom, &block_mvs, &refs, false, false,
+            &mut InterPredScratch::default(),
         );
 
         // Independently re-derive the expected samples via the spec chain.
@@ -926,6 +943,7 @@ mod tests {
         let mut dst = Plane::new(64, 64);
         predict_inter(
             &mut dst, &args, &grid, &geom, &block_mvs, &refs, false, false,
+            &mut InterPredScratch::default(),
         );
 
         // Re-derive each list's prediction, then average per §8.5.2.

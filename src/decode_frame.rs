@@ -58,7 +58,7 @@ use crate::header::{
 };
 use crate::inter_decode::{build_ref_planes, FrameStateMvSource, PrevFrameMvs};
 use crate::inter_mv::{BlockGrid, ScaleGeom};
-use crate::inter_pred::{predict_inter, InterPredArgs};
+use crate::inter_pred::{predict_inter, InterPredArgs, InterPredScratch};
 use crate::intra::{predict_intra, Plane, PredMode};
 use crate::loop_filter::loop_filter_frame_init;
 use crate::mode_info::{
@@ -141,6 +141,7 @@ struct BlockDecoder<'a> {
     nz: &'a mut [NonzeroContext; 3],
     token_cache: &'a mut [u8; 1024],
     tok_buf: &'a mut [i64; 1024],
+    inter_pred_scratch: InterPredScratch,
     /// §9.3.4 per-frame syntax-element count bank (cleared per frame by
     /// §8.3 `clear_counts( )`; consumed by §6.1.2 `refresh_probs( )`).
     counts: &'a mut crate::prob_adapt::FrameCounts,
@@ -1080,6 +1081,7 @@ impl BlockDecoder<'_> {
             &refs,
             self.subsampling_x,
             self.subsampling_y,
+            &mut self.inter_pred_scratch,
         );
     }
 }
@@ -1262,6 +1264,7 @@ fn decode_one_tile(
         nz: ws.nz,
         token_cache: ws.token_cache,
         tok_buf: ws.tok_buf,
+        inter_pred_scratch: InterPredScratch::default(),
         counts: ws.counts,
         inter: inter_ctx,
     };
@@ -2528,6 +2531,7 @@ pub(crate) fn decode_keyframe_blocks_for_test(
             nz: &mut nz,
             token_cache: &mut token_cache,
             tok_buf: &mut tok_buf,
+            inter_pred_scratch: InterPredScratch::default(),
             counts: &mut counts,
             inter: None,
         };

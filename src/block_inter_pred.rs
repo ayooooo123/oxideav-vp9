@@ -274,6 +274,8 @@ where
 /// from the clipped row's slice (no per-tap clip, no per-sample call),
 /// which is every interior column. Bit-identical to the generic form
 /// (the tap products are accumulated in the same order).
+/// Caller-owned buffers grow only when needed. Every sample in the active
+/// `w * h` output prefix is overwritten; retained capacity is not cleared.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn block_inter_predict_plane(
     samples: &[i32],
@@ -288,9 +290,15 @@ pub(crate) fn block_inter_predict_plane(
     last_x: i32,
     last_y: i32,
     bit_depth: u32,
-) -> Vec<i32> {
+    intermediate: &mut Vec<i32>,
+    pred: &mut Vec<i32>,
+) {
     debug_assert!(interp_filter < 4, "interp_filter must be 0..3");
     debug_assert!(w > 0 && h > 0, "block dimensions must be non-zero");
+    if pred.len() < w * h {
+        pred.resize(w * h, 0);
+    }
+    let pred = &mut pred[..w * h];
 
     let filter = &SUBPEL_FILTERS[interp_filter];
     // Fast path: unscaled reference (x_step == 16, y_step == 16)
@@ -310,29 +318,22 @@ pub(crate) fn block_inter_predict_plane(
             && y >= 0
             && (y >> 4) + h as i32 <= last_y + 1
         {
-            let mut pred = vec![0i32; h * w];
             for r in 0..h {
                 let src_offset = (base_y + r) * stride + base_x;
                 pred[r * w..(r + 1) * w].copy_from_slice(&samples[src_offset..src_offset + w]);
             }
-            return pred;
+            return;
         }
 
         let taps_x = &filter[phase_x];
         let taps_y = &filter[phase_y];
         let intermediate_height = h + 7;
 
-        // Use stack buffer for unscaled block to eliminate heap allocation
-        const STACK_INTERMEDIATE_CAP: usize = 4608; // (64 + 7) * 64 = 4544
         let needed = intermediate_height * w;
-        let mut stack_intermediate = [0i32; STACK_INTERMEDIATE_CAP];
-        let mut heap_intermediate;
-        let intermediate: &mut [i32] = if needed <= STACK_INTERMEDIATE_CAP {
-            &mut stack_intermediate[..needed]
-        } else {
-            heap_intermediate = vec![0i32; needed];
-            &mut heap_intermediate[..]
-        };
+        if intermediate.len() < needed {
+            intermediate.resize(needed, 0);
+        }
+        let intermediate = &mut intermediate[..needed];
 
         for r in 0..intermediate_height {
             let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - 3) as usize;
@@ -358,7 +359,6 @@ pub(crate) fn block_inter_predict_plane(
             }
         }
 
-        let mut pred = vec![0i32; h * w];
         for r in 0..h {
             let base_row = r;
             let out = &mut pred[r * w..(r + 1) * w];
@@ -370,11 +370,15 @@ pub(crate) fn block_inter_predict_plane(
                 *slot = clip1(round2(s, 7), bit_depth);
             }
         }
-        return pred;
+        return;
     }
     let intermediate_height = ((((h as i32 - 1) * y_step + 15) >> 4) + 8) as usize;
 
-    let mut intermediate = vec![0i32; intermediate_height * w];
+    let needed = intermediate_height * w;
+    if intermediate.len() < needed {
+        intermediate.resize(needed, 0);
+    }
+    let intermediate = &mut intermediate[..needed];
     for r in 0..intermediate_height {
         let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - 3) as usize;
         let row = &samples[ref_row * stride..ref_row * stride + (last_x as usize + 1)];
@@ -400,7 +404,6 @@ pub(crate) fn block_inter_predict_plane(
         }
     }
 
-    let mut pred = vec![0i32; h * w];
     for r in 0..h {
         let p = (y & SUBPEL_MASK) + y_step * r as i32;
         let phase = (p & SUBPEL_MASK) as usize;
@@ -414,7 +417,6 @@ pub(crate) fn block_inter_predict_plane(
             pred[r * w + c] = clip1(round2(s, 7), bit_depth);
         }
     }
-    pred
 }
 
 #[cfg(test)]
@@ -432,6 +434,8 @@ mod tests {
             .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 20) as i32 & 0xff)
             .collect();
         let (last_x, last_y) = (pw as i32 - 1, ph as i32 - 1);
+        let mut intermediate = Vec::new();
+        let mut output = Vec::new();
         for filt in 0..4usize {
             for (xs, ys) in [(16, 16), (32, 16), (16, 24), (20, 20)] {
                 for (w, h) in [(4usize, 4usize), (8, 4), (16, 16)] {
@@ -450,10 +454,11 @@ mod tests {
                                 last_y,
                                 8,
                             );
-                            let b = block_inter_predict_plane(
+                            block_inter_predict_plane(
                                 &samples, pw, x, y, xs, ys, w, h, filt, last_x, last_y, 8,
+                                &mut intermediate, &mut output,
                             );
-                            assert_eq!(a, b, "filter {filt} step ({xs},{ys}) {w}x{h} at ({x},{y})");
+                            assert_eq!(a.as_slice(), &output[..w * h], "filter {filt} step ({xs},{ys}) {w}x{h} at ({x},{y})");
                         }
                     }
                 }
