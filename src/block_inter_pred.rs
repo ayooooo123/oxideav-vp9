@@ -354,8 +354,23 @@ pub(crate) fn block_inter_predict_plane(
             }
             let base_col_start = (x >> 4) - 3;
 
-            for (c, slot) in out.iter_mut().enumerate() {
+            let mut c = 0;
+            while c < w {
                 let base_col = base_col_start + c as i32;
+                if c + 4 <= w && base_col >= 0 && base_col + 10 <= last_x {
+                    let win = &row[base_col as usize..base_col as usize + 11];
+                    let mut sums = [0i32; 4];
+                    for (t, &tap) in taps_x.iter().enumerate() {
+                        for lane in 0..4 {
+                            sums[lane] += tap * win[t + lane];
+                        }
+                    }
+                    for lane in 0..4 {
+                        out[c + lane] = clip1(round2(sums[lane], 7), bit_depth);
+                    }
+                    c += 4;
+                    continue;
+                }
                 let mut s = 0i32;
                 if base_col >= 0 && base_col + 7 <= last_x {
                     let win = &row[base_col as usize..base_col as usize + 8];
@@ -368,7 +383,8 @@ pub(crate) fn block_inter_predict_plane(
                         s += tap * row[ref_col as usize];
                     }
                 }
-                *slot = clip1(round2(s, 7), bit_depth);
+                out[c] = clip1(round2(s, 7), bit_depth);
+                c += 1;
             }
         }
 
@@ -376,10 +392,25 @@ pub(crate) fn block_inter_predict_plane(
             return;
         }
 
+        let vector_end = w / 4 * 4;
         for r in 0..h {
             let base_row = r;
             let out = &mut pred[r * w..(r + 1) * w];
-            for (c, slot) in out.iter_mut().enumerate() {
+            for c in (0..vector_end).step_by(4) {
+                let mut sums = [0i32; 4];
+                for (t, &tap) in taps_y.iter().enumerate() {
+                    let offset = (base_row + t) * w + c;
+                    let samples = &intermediate[offset..offset + 4];
+                    for lane in 0..4 {
+                        sums[lane] += tap * samples[lane];
+                    }
+                }
+                for lane in 0..4 {
+                    out[c + lane] = clip1(round2(sums[lane], 7), bit_depth);
+                }
+            }
+            for (tail, slot) in out[vector_end..].iter_mut().enumerate() {
+                let c = vector_end + tail;
                 let mut s = 0i32;
                 for (t, &tap) in taps_y.iter().enumerate() {
                     s += tap * intermediate[(base_row + t) * w + c];
