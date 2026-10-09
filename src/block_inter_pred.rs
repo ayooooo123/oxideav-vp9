@@ -461,6 +461,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reused_plane_buffers_match_generic_across_shapes_and_depths() {
+        let mut intermediate = Vec::new();
+        let mut output = Vec::new();
+        let (stride, width, height) = (99usize, 96usize, 80usize);
+        let cases = [
+            (64, 64, 16, 16, 0, 0),
+            (4, 4, 16, 16, -17, -9),
+            (32, 16, 32, 24, 11, 15),
+            (8, 64, 16, 16, 1500, 1250),
+            (64, 8, 20, 20, -40, 19),
+            (4, 4, 16, 16, 160, 160),
+        ];
+        for depth in [8, 10, 12] {
+            for filter in 0..4 {
+                for (turn, &(w, h, xs, ys, x, y)) in cases.iter().enumerate() {
+                    let mask = (1 << depth) - 1;
+                    let samples: Vec<i32> = (0..stride * height)
+                        .map(|i| {
+                            ((i as u64 + turn as u64 * 7919)
+                                .wrapping_mul(2_654_435_761) >> 17) as i32 & mask
+                        })
+                        .collect();
+                    let expected = block_inter_predict(
+                        |r, c| samples[r as usize * stride + c as usize],
+                        x, y, xs, ys, w, h, filter,
+                        width as i32 - 1, height as i32 - 1, depth,
+                    );
+                    block_inter_predict_plane(
+                        &samples, stride, x, y, xs, ys, w, h, filter,
+                        width as i32 - 1, height as i32 - 1, depth,
+                        &mut intermediate, &mut output,
+                    );
+                    assert_eq!(
+                        &output[..w * h], expected.as_slice(),
+                        "depth {depth} filter {filter} turn {turn} {w}x{h}",
+                    );
+                }
+            }
+        }
+    }
+
     /// Every §8.5.2.4 sub-pixel kernel sums to `1 << 7 = 128`, the
     /// normalisation that `Round2( s, 7 )` divides out.
     #[test]

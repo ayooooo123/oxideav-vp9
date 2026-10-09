@@ -278,6 +278,101 @@ mod tests {
         v
     }
 
+    #[test]
+    fn reused_scratch_preserves_single_compound_and_clipped_predictions() {
+        let mut scratch = InterPredScratch::default();
+        let shapes = [(64, 64), (4, 4), (32, 16), (8, 64), (64, 8), (4, 4)];
+        for depth in [8, 10, 12] {
+            let mask = (1 << depth) - 1;
+            for (turn, &(w, h)) in shapes.iter().enumerate() {
+                let first: Vec<i32> = (0..99 * 80)
+                    .map(|i| (i * 37 + turn as i32 * 101) & mask)
+                    .collect();
+                let second: Vec<i32> = (0..83 * 64)
+                    .map(|i| (i * 53 + turn as i32 * 307) & mask)
+                    .collect();
+                let compound = turn % 2 == 0;
+                let refs = RefPlanes {
+                    list: [
+                        Some(RefPlane {
+                            samples: &first, stride: 99,
+                            ref_frame_width: 96, ref_frame_height: 80,
+                        }),
+                        compound.then_some(RefPlane {
+                            samples: &second, stride: 83,
+                            ref_frame_width: 80, ref_frame_height: 64,
+                        }),
+                    ],
+                };
+                let (x, y) = if turn % 3 == 0 { (0, 0) } else { (88, 72) };
+                let args = InterPredArgs {
+                    plane: 0, x, y, w, h, block_idx: 0,
+                    interp_filter: turn % 4, bit_depth: depth,
+                    is_compound: compound,
+                };
+                let grid = BlockGrid {
+                    mi_row: y / 8, mi_col: x / 8,
+                    mi_rows: 10, mi_cols: 12, mi_size: BLOCK_64X64,
+                };
+                let geom = ScaleGeom {
+                    ref_frame_width: 96, ref_frame_height: 80,
+                    frame_width: 96, frame_height: 80,
+                    subsampling_x: false, subsampling_y: false,
+                };
+                let block_mvs = [[[turn as i32 - 9, 13]; 4], [[7, -11]; 4]];
+                let mut expected = Vec::new();
+                for (list, reference) in refs.list.iter().flatten().enumerate() {
+                    let mv = select_mv(
+                        &block_mvs[list], 0, grid.mi_size, 0, false, false,
+                    );
+                    let clamped = clamp_mv(&grid, mv, 0, false, false);
+                    let scaled = scale_mv(
+                        &ScaleGeom {
+                            ref_frame_width: reference.ref_frame_width,
+                            ref_frame_height: reference.ref_frame_height,
+                            ..geom
+                        },
+                        0, x, y, clamped,
+                    );
+                    expected.push(crate::block_inter_pred::block_inter_predict(
+                        |r, c| reference.samples[r as usize * reference.stride + c as usize],
+                        scaled.start_x, scaled.start_y, scaled.step_x, scaled.step_y,
+                        w, h, args.interp_filter,
+                        reference.ref_frame_width - 1, reference.ref_frame_height - 1,
+                        depth,
+                    ));
+                }
+                let mut dst = Plane::new(96, 80);
+                for row in 0..80 {
+                    for col in 0..96 {
+                        dst.set(col, row, 17);
+                    }
+                }
+                predict_inter(
+                    &mut dst, &args, &grid, &geom, &block_mvs, &refs,
+                    false, false, &mut scratch,
+                );
+                for row in 0..80 {
+                    for col in 0..96 {
+                        let value = if col >= x as usize && col < x as usize + w
+                            && row >= y as usize && row < y as usize + h
+                        {
+                            let index = (row - y as usize) * w + col - x as usize;
+                            if compound {
+                                (expected[0][index] + expected[1][index] + 1) >> 1
+                            } else {
+                                expected[0][index]
+                            }
+                        } else {
+                            17
+                        };
+                        assert_eq!(dst.get(col, row), value, "depth {depth} turn {turn} at {col},{row}");
+                    }
+                }
+            }
+        }
+    }
+
     /// A zero motion vector, same-size reference, integer block
     /// location, luma plane, phase-0 filter: the §8.5.2 chain reduces to
     /// a straight copy of the co-located reference region into
