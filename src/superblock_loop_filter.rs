@@ -58,9 +58,7 @@
 //! lines 2871-2876).
 
 use crate::adaptive_filter_strength::adaptive_filter_strength;
-use crate::filter_size::{
-    filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_4X4, TX_8X8,
-};
+use crate::filter_size::{filter_size, PASS_VERTICAL, TX_16X16, TX_8X8};
 use crate::loop_filter::LvlLookup;
 use crate::residual::get_uv_tx_size;
 use crate::sample_filtering::{sample_filtering, SampleFilterOutput, SampleFilterSamples};
