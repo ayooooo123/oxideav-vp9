@@ -423,6 +423,49 @@ pub(crate) fn block_inter_predict_plane(
 mod tests {
     use super::*;
 
+    #[test]
+    fn identity_axes_match_generic_for_all_phases_and_clipped_edges() {
+        let (width, height, stride) = (41usize, 29usize, 48usize);
+        let mut intermediate = Vec::new();
+        let mut output = Vec::new();
+        for bit_depth in [8, 10, 12] {
+            let mask = (1 << bit_depth) - 1;
+            let samples: Vec<i32> = (0..stride * height)
+                .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 19) as i32 & mask)
+                .collect();
+            for filter in 0..4 {
+                for (phase_x, phase_y) in (0..16)
+                    .map(|phase| (phase, 0))
+                    .chain((1..16).map(|phase| (0, phase)))
+                {
+                    for (origin_x, origin_y) in
+                        [(-4, -4), (-4, 8), (7, -4), (7, 8), (35, 24), (41, 29)]
+                    {
+                        for (w, h) in [(4usize, 4usize), (16, 8)] {
+                            let x = origin_x * 16 + phase_x;
+                            let y = origin_y * 16 + phase_y;
+                            let expected = block_inter_predict(
+                                |r, c| samples[r as usize * stride + c as usize],
+                                x, y, 16, 16, w, h, filter,
+                                width as i32 - 1, height as i32 - 1, bit_depth,
+                            );
+                            block_inter_predict_plane(
+                                &samples, stride, x, y, 16, 16, w, h, filter,
+                                width as i32 - 1, height as i32 - 1, bit_depth,
+                                &mut intermediate, &mut output,
+                            );
+                            assert_eq!(
+                                expected.as_slice(), &output[..w * h],
+                                "depth {bit_depth}, filter {filter}, phase ({phase_x},{phase_y}), \
+                                 origin ({origin_x},{origin_y}), shape {w}x{h}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// The plane form equals the generic form sample for sample across
     /// every kernel, scaled and unscaled steps, and blocks straddling
     /// every plane edge (the clipped-window fallback) — a hash-texture
