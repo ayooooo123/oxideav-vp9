@@ -58,7 +58,9 @@
 //! lines 2871-2876).
 
 use crate::adaptive_filter_strength::adaptive_filter_strength;
-use crate::filter_size::{filter_size, PASS_VERTICAL};
+use crate::filter_size::{
+    filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_4X4, TX_8X8,
+};
 use crate::loop_filter::LvlLookup;
 use crate::residual::get_uv_tx_size;
 use crate::sample_filtering::{sample_filtering, SampleFilterOutput, SampleFilterSamples};
@@ -227,6 +229,602 @@ fn scatter_stencil(
         plane.set_in_bounds(x + dx * k, y + dy * k, v);
     }
 }
+#[inline]
+fn filter_single_sample_fallback(
+    plane_buf: &mut SuperblockFilterPlane,
+    frame: &SuperblockFilterFrame,
+    plane: u8,
+    pass: u8,
+    row: u32,
+    col: u32,
+    edge: u32,
+    i: u32,
+    sub_x: u32,
+    sub_y: u32,
+    geom: &crate::superblock_filter::SuperblockFilterGeometry,
+) {
+    let (x, y) = if pass == PASS_VERTICAL {
+        (col * 8 + edge * (4 << sub_x), row * 8 + (i << sub_y))
+    } else {
+        (col * 8 + (i << sub_x), row * 8 + edge * (4 << sub_y))
+    };
+
+    if x >= 8 * frame.mi_cols || y >= 8 * frame.mi_rows {
+        return;
+    }
+
+    let loop_col = ((x >> 3) >> sub_x) << sub_x;
+    let loop_row = ((y >> 3) >> sub_y) << sub_y;
+    let idx = loop_row as usize * frame.mi_cols as usize + loop_col as usize;
+
+    let mi_size = frame.mi_sizes[idx];
+    let tx_size = frame.tx_sizes[idx];
+    let tx_sz = if plane > 0 {
+        get_uv_tx_size(
+            u32::from(tx_size),
+            mi_size,
+            frame.subsampling_x == 1,
+            frame.subsampling_y == 1,
+        ) as u8
+    } else {
+        tx_size
+    };
+
+    let mi = SuperblockFilterMi {
+        mi_size,
+        tx_sz,
+        skip: frame.skips[idx],
+        ref_frame_0: frame.ref_frames_0[idx],
+    };
+    let e = superblock_filter_edge(
+        pass,
+        row,
+        col,
+        edge,
+        i,
+        sub_x,
+        sub_y,
+        frame.mi_cols,
+        frame.mi_rows,
+        &mi,
+    );
+    if !e.apply_filter {
+        return;
+    }
+
+    let f_size = filter_size(
+        tx_sz,
+        e.is_32_edge,
+        pass,
+        e.x,
+        e.y,
+        sub_x as u8,
+        sub_y as u8,
+        frame.mi_cols,
+        frame.mi_rows,
+    );
+
+    let strength = adaptive_filter_strength(
+        frame.lvl_lookup,
+        frame.segment_ids[idx] as usize,
+        frame.ref_frames_0[idx],
+        frame.y_modes[idx],
+        frame.loop_filter_sharpness,
+    )
+    .expect("§8.8.4: segment_id must be < 8 and ref_frame in 0..=3");
+
+    if strength.lvl > 0 {
+        let px = i64::from(e.x >> sub_x);
+        let py = i64::from(e.y >> sub_y);
+        let (dx, dy) = (i64::from(geom.dx), i64::from(geom.dy));
+        let stencil = gather_stencil(plane_buf, px, py, dx, dy);
+        let out = sample_filtering(
+            &stencil,
+            strength.limit,
+            strength.blimit,
+            strength.thresh,
+            f_size,
+            frame.bit_depth,
+        );
+        scatter_stencil(plane_buf, px, py, dx, dy, &out);
+    }
+}
+
+#[inline(always)]
+fn filter_edge_vertical_4(
+    data: &mut [i32],
+    stride: usize,
+    px: usize,
+    py: usize,
+    limit_bd: i32,
+    blimit_bd: i32,
+    thresh_bd: i32,
+    bit_depth: u8,
+) {
+    let half = 1_i32 << (bit_depth - 1);
+    let max_val = (1_i32 << bit_depth) - 1;
+
+    for r in 0..8 {
+        let row_start = (py + r) * stride + px;
+        let p3 = data[row_start - 4];
+        let p2 = data[row_start - 3];
+        let p1 = data[row_start - 2];
+        let p0 = data[row_start - 1];
+        let q0 = data[row_start + 0];
+        let q1 = data[row_start + 1];
+        let q2 = data[row_start + 2];
+        let q3 = data[row_start + 3];
+
+        let fm = (p3 - p2).abs() <= limit_bd
+            && (p2 - p1).abs() <= limit_bd
+            && (p1 - p0).abs() <= limit_bd
+            && (q1 - q0).abs() <= limit_bd
+            && (q2 - q1).abs() <= limit_bd
+            && (q3 - q2).abs() <= limit_bd
+            && ((p0 - q0).abs() * 2 + ((p1 - q1).abs() >> 1)) <= blimit_bd;
+
+        if !fm {
+            continue;
+        }
+
+        let hev = (p1 - p0).abs() > thresh_bd || (q1 - q0).abs() > thresh_bd;
+
+        let f = if hev {
+            let clamped_diff = (p1 - q1).clamp(-half, half - 1);
+            (3 * (q0 - p0) + clamped_diff).clamp(-half, half - 1)
+        } else {
+            (3 * (q0 - p0)).clamp(-half, half - 1)
+        };
+
+        let f1 = (f + 4).clamp(-half, half - 1) >> 3;
+        let f2 = (f + 3).clamp(-half, half - 1) >> 3;
+
+        data[row_start - 1] = (p0 + f2).clamp(0, max_val);
+        data[row_start + 0] = (q0 - f1).clamp(0, max_val);
+
+        if !hev {
+            let f_half = (f1 + 1) >> 1;
+            data[row_start - 2] = (p1 + f_half).clamp(0, max_val);
+            data[row_start + 1] = (q1 - f_half).clamp(0, max_val);
+        }
+    }
+}
+
+#[inline(always)]
+fn filter_edge_vertical_8(
+    data: &mut [i32],
+    stride: usize,
+    px: usize,
+    py: usize,
+    limit_bd: i32,
+    blimit_bd: i32,
+    thresh_bd: i32,
+    thresh_1: i32,
+    bit_depth: u8,
+) {
+    let half = 1_i32 << (bit_depth - 1);
+    let max_val = (1_i32 << bit_depth) - 1;
+
+    for r in 0..8 {
+        let row_start = (py + r) * stride + px;
+        let p3 = data[row_start - 4];
+        let p2 = data[row_start - 3];
+        let p1 = data[row_start - 2];
+        let p0 = data[row_start - 1];
+        let q0 = data[row_start + 0];
+        let q1 = data[row_start + 1];
+        let q2 = data[row_start + 2];
+        let q3 = data[row_start + 3];
+
+        let fm = (p3 - p2).abs() <= limit_bd
+            && (p2 - p1).abs() <= limit_bd
+            && (p1 - p0).abs() <= limit_bd
+            && (q1 - q0).abs() <= limit_bd
+            && (q2 - q1).abs() <= limit_bd
+            && (q3 - q2).abs() <= limit_bd
+            && ((p0 - q0).abs() * 2 + ((p1 - q1).abs() >> 1)) <= blimit_bd;
+
+        if !fm {
+            continue;
+        }
+
+        let flat8in = (p3 - p0).abs() <= thresh_1
+            && (p2 - p0).abs() <= thresh_1
+            && (p1 - p0).abs() <= thresh_1
+            && (q1 - q0).abs() <= thresh_1
+            && (q2 - q0).abs() <= thresh_1
+            && (q3 - q0).abs() <= thresh_1;
+
+        if flat8in {
+            data[row_start - 3] = (p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3;
+            data[row_start - 2] = (p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3;
+            data[row_start - 1] = (p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3;
+            data[row_start + 0] = (p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3;
+            data[row_start + 1] = (p1 + p0 + q0 + q1 * 2 + q2 + q3 * 2 + 4) >> 3;
+            data[row_start + 2] = (p0 + q0 + q1 + q2 * 2 + q3 * 3 + 4) >> 3;
+        } else {
+            let hev = (p1 - p0).abs() > thresh_bd || (q1 - q0).abs() > thresh_bd;
+
+            let f = if hev {
+                let clamped_diff = (p1 - q1).clamp(-half, half - 1);
+                (3 * (q0 - p0) + clamped_diff).clamp(-half, half - 1)
+            } else {
+                (3 * (q0 - p0)).clamp(-half, half - 1)
+            };
+
+            let f1 = (f + 4).clamp(-half, half - 1) >> 3;
+            let f2 = (f + 3).clamp(-half, half - 1) >> 3;
+
+            data[row_start - 1] = (p0 + f2).clamp(0, max_val);
+            data[row_start + 0] = (q0 - f1).clamp(0, max_val);
+
+            if !hev {
+                let f_half = (f1 + 1) >> 1;
+                data[row_start - 2] = (p1 + f_half).clamp(0, max_val);
+                data[row_start + 1] = (q1 - f_half).clamp(0, max_val);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn filter_edge_vertical_16(
+    data: &mut [i32],
+    stride: usize,
+    px: usize,
+    py: usize,
+    limit_bd: i32,
+    blimit_bd: i32,
+    thresh_bd: i32,
+    thresh_1: i32,
+    bit_depth: u8,
+) {
+    let half = 1_i32 << (bit_depth - 1);
+    let max_val = (1_i32 << bit_depth) - 1;
+
+    for r in 0..8 {
+        let row_start = (py + r) * stride + px;
+        let p3 = data[row_start - 4];
+        let p2 = data[row_start - 3];
+        let p1 = data[row_start - 2];
+        let p0 = data[row_start - 1];
+        let q0 = data[row_start + 0];
+        let q1 = data[row_start + 1];
+        let q2 = data[row_start + 2];
+        let q3 = data[row_start + 3];
+
+        let fm = (p3 - p2).abs() <= limit_bd
+            && (p2 - p1).abs() <= limit_bd
+            && (p1 - p0).abs() <= limit_bd
+            && (q1 - q0).abs() <= limit_bd
+            && (q2 - q1).abs() <= limit_bd
+            && (q3 - q2).abs() <= limit_bd
+            && ((p0 - q0).abs() * 2 + ((p1 - q1).abs() >> 1)) <= blimit_bd;
+
+        if !fm {
+            continue;
+        }
+
+        let flat8in = (p3 - p0).abs() <= thresh_1
+            && (p2 - p0).abs() <= thresh_1
+            && (p1 - p0).abs() <= thresh_1
+            && (q1 - q0).abs() <= thresh_1
+            && (q2 - q0).abs() <= thresh_1
+            && (q3 - q0).abs() <= thresh_1;
+
+        let p7 = data[row_start - 8];
+        let p6 = data[row_start - 7];
+        let p5 = data[row_start - 6];
+        let p4 = data[row_start - 5];
+        let q4 = data[row_start + 4];
+        let q5 = data[row_start + 5];
+        let q6 = data[row_start + 6];
+        let q7 = data[row_start + 7];
+
+        let flat8out = flat8in
+            && (p7 - p0).abs() <= thresh_1
+            && (p6 - p0).abs() <= thresh_1
+            && (p5 - p0).abs() <= thresh_1
+            && (p4 - p0).abs() <= thresh_1
+            && (q4 - q0).abs() <= thresh_1
+            && (q5 - q0).abs() <= thresh_1
+            && (q6 - q0).abs() <= thresh_1
+            && (q7 - q0).abs() <= thresh_1;
+
+        if flat8out {
+            data[row_start - 7] = (p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0 + 8) >> 4;
+            data[row_start - 6] = (p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1 + 8) >> 4;
+            data[row_start - 5] = (p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4;
+            data[row_start - 4] = (p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3 + 8) >> 4;
+            data[row_start - 3] = (p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 + 8) >> 4;
+            data[row_start - 2] = (p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + q4 + q5 + 8) >> 4;
+            data[row_start - 1] = (p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + q5 + q6 + 8) >> 4;
+            data[row_start + 0] = (p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + q6 + q7 + 8) >> 4;
+            data[row_start + 1] = (p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + q7 * 2 + 8) >> 4;
+            data[row_start + 2] = (p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 + q4 + q5 + q6 + q7 * 3 + 8) >> 4;
+            data[row_start + 3] = (p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4 + 8) >> 4;
+            data[row_start + 4] = (p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5 + 8) >> 4;
+            data[row_start + 5] = (p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6 + 8) >> 4;
+            data[row_start + 6] = (p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7 + 8) >> 4;
+        } else if flat8in {
+            data[row_start - 3] = (p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3;
+            data[row_start - 2] = (p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3;
+            data[row_start - 1] = (p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3;
+            data[row_start + 0] = (p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3;
+            data[row_start + 1] = (p1 + p0 + q0 + q1 * 2 + q2 + q3 * 2 + 4) >> 3;
+            data[row_start + 2] = (p0 + q0 + q1 + q2 * 2 + q3 * 3 + 4) >> 3;
+        } else {
+            let hev = (p1 - p0).abs() > thresh_bd || (q1 - q0).abs() > thresh_bd;
+
+            let f = if hev {
+                let clamped_diff = (p1 - q1).clamp(-half, half - 1);
+                (3 * (q0 - p0) + clamped_diff).clamp(-half, half - 1)
+            } else {
+                (3 * (q0 - p0)).clamp(-half, half - 1)
+            };
+
+            let f1 = (f + 4).clamp(-half, half - 1) >> 3;
+            let f2 = (f + 3).clamp(-half, half - 1) >> 3;
+
+            data[row_start - 1] = (p0 + f2).clamp(0, max_val);
+            data[row_start + 0] = (q0 - f1).clamp(0, max_val);
+
+            if !hev {
+                let f_half = (f1 + 1) >> 1;
+                data[row_start - 2] = (p1 + f_half).clamp(0, max_val);
+                data[row_start + 1] = (q1 - f_half).clamp(0, max_val);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn filter_edge_horizontal_4(
+    data: &mut [i32],
+    stride: usize,
+    px: usize,
+    py: usize,
+    limit_bd: i32,
+    blimit_bd: i32,
+    thresh_bd: i32,
+    bit_depth: u8,
+) {
+    let half = 1_i32 << (bit_depth - 1);
+    let max_val = (1_i32 << bit_depth) - 1;
+
+    for c in 0..8 {
+        let col = px + c;
+        let p3 = data[(py - 4) * stride + col];
+        let p2 = data[(py - 3) * stride + col];
+        let p1 = data[(py - 2) * stride + col];
+        let p0 = data[(py - 1) * stride + col];
+        let q0 = data[(py + 0) * stride + col];
+        let q1 = data[(py + 1) * stride + col];
+        let q2 = data[(py + 2) * stride + col];
+        let q3 = data[(py + 3) * stride + col];
+
+        let fm = (p3 - p2).abs() <= limit_bd
+            && (p2 - p1).abs() <= limit_bd
+            && (p1 - p0).abs() <= limit_bd
+            && (q1 - q0).abs() <= limit_bd
+            && (q2 - q1).abs() <= limit_bd
+            && (q3 - q2).abs() <= limit_bd
+            && ((p0 - q0).abs() * 2 + ((p1 - q1).abs() >> 1)) <= blimit_bd;
+
+        if !fm {
+            continue;
+        }
+
+        let hev = (p1 - p0).abs() > thresh_bd || (q1 - q0).abs() > thresh_bd;
+
+        let f = if hev {
+            let clamped_diff = (p1 - q1).clamp(-half, half - 1);
+            (3 * (q0 - p0) + clamped_diff).clamp(-half, half - 1)
+        } else {
+            (3 * (q0 - p0)).clamp(-half, half - 1)
+        };
+
+        let f1 = (f + 4).clamp(-half, half - 1) >> 3;
+        let f2 = (f + 3).clamp(-half, half - 1) >> 3;
+
+        data[(py - 1) * stride + col] = (p0 + f2).clamp(0, max_val);
+        data[(py + 0) * stride + col] = (q0 - f1).clamp(0, max_val);
+
+        if !hev {
+            let f_half = (f1 + 1) >> 1;
+            data[(py - 2) * stride + col] = (p1 + f_half).clamp(0, max_val);
+            data[(py + 1) * stride + col] = (q1 - f_half).clamp(0, max_val);
+        }
+    }
+}
+
+#[inline(always)]
+fn filter_edge_horizontal_8(
+    data: &mut [i32],
+    stride: usize,
+    px: usize,
+    py: usize,
+    limit_bd: i32,
+    blimit_bd: i32,
+    thresh_bd: i32,
+    thresh_1: i32,
+    bit_depth: u8,
+) {
+    let half = 1_i32 << (bit_depth - 1);
+    let max_val = (1_i32 << bit_depth) - 1;
+
+    for c in 0..8 {
+        let col = px + c;
+        let p3 = data[(py - 4) * stride + col];
+        let p2 = data[(py - 3) * stride + col];
+        let p1 = data[(py - 2) * stride + col];
+        let p0 = data[(py - 1) * stride + col];
+        let q0 = data[(py + 0) * stride + col];
+        let q1 = data[(py + 1) * stride + col];
+        let q2 = data[(py + 2) * stride + col];
+        let q3 = data[(py + 3) * stride + col];
+
+        let fm = (p3 - p2).abs() <= limit_bd
+            && (p2 - p1).abs() <= limit_bd
+            && (p1 - p0).abs() <= limit_bd
+            && (q1 - q0).abs() <= limit_bd
+            && (q2 - q1).abs() <= limit_bd
+            && (q3 - q2).abs() <= limit_bd
+            && ((p0 - q0).abs() * 2 + ((p1 - q1).abs() >> 1)) <= blimit_bd;
+
+        if !fm {
+            continue;
+        }
+
+        let flat8in = (p3 - p0).abs() <= thresh_1
+            && (p2 - p0).abs() <= thresh_1
+            && (p1 - p0).abs() <= thresh_1
+            && (q1 - q0).abs() <= thresh_1
+            && (q2 - q0).abs() <= thresh_1
+            && (q3 - q0).abs() <= thresh_1;
+
+        if flat8in {
+            data[(py - 3) * stride + col] = (p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3;
+            data[(py - 2) * stride + col] = (p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3;
+            data[(py - 1) * stride + col] = (p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3;
+            data[(py + 0) * stride + col] = (p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3;
+            data[(py + 1) * stride + col] = (p1 + p0 + q0 + q1 * 2 + q2 + q3 * 2 + 4) >> 3;
+            data[(py + 2) * stride + col] = (p0 + q0 + q1 + q2 * 2 + q3 * 3 + 4) >> 3;
+        } else {
+            let hev = (p1 - p0).abs() > thresh_bd || (q1 - q0).abs() > thresh_bd;
+
+            let f = if hev {
+                let clamped_diff = (p1 - q1).clamp(-half, half - 1);
+                (3 * (q0 - p0) + clamped_diff).clamp(-half, half - 1)
+            } else {
+                (3 * (q0 - p0)).clamp(-half, half - 1)
+            };
+
+            let f1 = (f + 4).clamp(-half, half - 1) >> 3;
+            let f2 = (f + 3).clamp(-half, half - 1) >> 3;
+
+            data[(py - 1) * stride + col] = (p0 + f2).clamp(0, max_val);
+            data[(py + 0) * stride + col] = (q0 - f1).clamp(0, max_val);
+
+            if !hev {
+                let f_half = (f1 + 1) >> 1;
+                data[(py - 2) * stride + col] = (p1 + f_half).clamp(0, max_val);
+                data[(py + 1) * stride + col] = (q1 - f_half).clamp(0, max_val);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn filter_edge_horizontal_16(
+    data: &mut [i32],
+    stride: usize,
+    px: usize,
+    py: usize,
+    limit_bd: i32,
+    blimit_bd: i32,
+    thresh_bd: i32,
+    thresh_1: i32,
+    bit_depth: u8,
+) {
+    let half = 1_i32 << (bit_depth - 1);
+    let max_val = (1_i32 << bit_depth) - 1;
+
+    for c in 0..8 {
+        let col = px + c;
+        let p3 = data[(py - 4) * stride + col];
+        let p2 = data[(py - 3) * stride + col];
+        let p1 = data[(py - 2) * stride + col];
+        let p0 = data[(py - 1) * stride + col];
+        let q0 = data[(py + 0) * stride + col];
+        let q1 = data[(py + 1) * stride + col];
+        let q2 = data[(py + 2) * stride + col];
+        let q3 = data[(py + 3) * stride + col];
+
+        let fm = (p3 - p2).abs() <= limit_bd
+            && (p2 - p1).abs() <= limit_bd
+            && (p1 - p0).abs() <= limit_bd
+            && (q1 - q0).abs() <= limit_bd
+            && (q2 - q1).abs() <= limit_bd
+            && (q3 - q2).abs() <= limit_bd
+            && ((p0 - q0).abs() * 2 + ((p1 - q1).abs() >> 1)) <= blimit_bd;
+
+        if !fm {
+            continue;
+        }
+
+        let flat8in = (p3 - p0).abs() <= thresh_1
+            && (p2 - p0).abs() <= thresh_1
+            && (p1 - p0).abs() <= thresh_1
+            && (q1 - q0).abs() <= thresh_1
+            && (q2 - q0).abs() <= thresh_1
+            && (q3 - q0).abs() <= thresh_1;
+
+        let p7 = data[(py - 8) * stride + col];
+        let p6 = data[(py - 7) * stride + col];
+        let p5 = data[(py - 6) * stride + col];
+        let p4 = data[(py - 5) * stride + col];
+        let q4 = data[(py + 4) * stride + col];
+        let q5 = data[(py + 5) * stride + col];
+        let q6 = data[(py + 6) * stride + col];
+        let q7 = data[(py + 7) * stride + col];
+
+        let flat8out = flat8in
+            && (p7 - p0).abs() <= thresh_1
+            && (p6 - p0).abs() <= thresh_1
+            && (p5 - p0).abs() <= thresh_1
+            && (p4 - p0).abs() <= thresh_1
+            && (q4 - q0).abs() <= thresh_1
+            && (q5 - q0).abs() <= thresh_1
+            && (q6 - q0).abs() <= thresh_1
+            && (q7 - q0).abs() <= thresh_1;
+
+        if flat8out {
+            data[(py - 7) * stride + col] = (p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0 + 8) >> 4;
+            data[(py - 6) * stride + col] = (p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1 + 8) >> 4;
+            data[(py - 5) * stride + col] = (p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4;
+            data[(py - 4) * stride + col] = (p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3 + 8) >> 4;
+            data[(py - 3) * stride + col] = (p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 + 8) >> 4;
+            data[(py - 2) * stride + col] = (p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + q4 + q5 + 8) >> 4;
+            data[(py - 1) * stride + col] = (p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + q5 + q6 + 8) >> 4;
+            data[(py + 0) * stride + col] = (p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + q6 + q7 + 8) >> 4;
+            data[(py + 1) * stride + col] = (p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + q7 * 2 + 8) >> 4;
+            data[(py + 2) * stride + col] = (p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 + q4 + q5 + q6 + q7 * 3 + 8) >> 4;
+            data[(py + 3) * stride + col] = (p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4 + 8) >> 4;
+            data[(py + 4) * stride + col] = (p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5 + 8) >> 4;
+            data[(py + 5) * stride + col] = (p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6 + 8) >> 4;
+            data[(py + 6) * stride + col] = (p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7 + 8) >> 4;
+        } else if flat8in {
+            data[(py - 3) * stride + col] = (p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3;
+            data[(py - 2) * stride + col] = (p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3;
+            data[(py - 1) * stride + col] = (p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3;
+            data[(py + 0) * stride + col] = (p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3;
+            data[(py + 1) * stride + col] = (p1 + p0 + q0 + q1 * 2 + q2 + q3 * 2 + 4) >> 3;
+            data[(py + 2) * stride + col] = (p0 + q0 + q1 + q2 * 2 + q3 * 3 + 4) >> 3;
+        } else {
+            let hev = (p1 - p0).abs() > thresh_bd || (q1 - q0).abs() > thresh_bd;
+
+            let f = if hev {
+                let clamped_diff = (p1 - q1).clamp(-half, half - 1);
+                (3 * (q0 - p0) + clamped_diff).clamp(-half, half - 1)
+            } else {
+                (3 * (q0 - p0)).clamp(-half, half - 1)
+            };
+
+            let f1 = (f + 4).clamp(-half, half - 1) >> 3;
+            let f2 = (f + 3).clamp(-half, half - 1) >> 3;
+
+            data[(py - 1) * stride + col] = (p0 + f2).clamp(0, max_val);
+            data[(py + 0) * stride + col] = (q0 - f1).clamp(0, max_val);
+
+            if !hev {
+                let f_half = (f1 + 1) >> 1;
+                data[(py - 2) * stride + col] = (p1 + f_half).clamp(0, max_val);
+                data[(py + 1) * stride + col] = (q1 - f_half).clamp(0, max_val);
+            }
+        }
+    }
+}
 
 /// Run the §8.8.2 `superblock loop filter process` per `vp9-spec.txt`
 /// lines 5491-5586, modifying `plane_buf` in place.
@@ -295,36 +893,59 @@ pub fn superblock_loop_filter(
     // §8.8.2 lines 5510-5519: dx / dy / sub / edgeLen.
     let geom = superblock_filter_geometry(pass, sub_x, sub_y);
 
-    // §8.8.2 lines 5524-5525: edge ∈ 0..(16 >> sub) - 1, i ∈ 0..edgeLen - 1.
-    for edge in 0..(16u32 >> geom.sub) {
-        for i in 0..geom.edge_len {
-            // Step 1 (lines 5527-5531): x / y in luma coordinates.
-            let (x, y) = if pass == PASS_VERTICAL {
-                (col * 8 + edge * (4 << sub_x), row * 8 + (i << sub_y))
+    // Process edges in runs of 8 samples with fixed 4/8/16-wide kernels
+    // when in-bounds, falling back to safe per-sample filtering at borders.
+    let num_edges = 16u32 >> geom.sub;
+    let num_chunks = geom.edge_len / 8;
+
+    for edge in 0..num_edges {
+        for i_chunk in 0..num_chunks {
+            let i_start = i_chunk * 8;
+            let (x0, y0) = if pass == PASS_VERTICAL {
+                (col * 8 + edge * (4 << sub_x), row * 8 + (i_start << sub_y))
             } else {
-                (col * 8 + (i << sub_x), row * 8 + edge * (4 << sub_y))
+                (col * 8 + (i_start << sub_x), row * 8 + edge * (4 << sub_y))
             };
 
-            // Step 13 right / bottom exclusions, hoisted ahead of the
-            // steps 4-9 per-MI reads: off-screen positions force
-            // applyFilter = 0 (step 14), making the reads dead — and
-            // hoisting keeps (loopRow, loopCol) inside MiRows x MiCols.
-            if x >= 8 * frame.mi_cols || y >= 8 * frame.mi_rows {
+            if x0 >= 8 * frame.mi_cols || y0 >= 8 * frame.mi_rows {
                 continue;
             }
 
-            // Steps 2-3 (lines 5532-5533): loopCol / loopRow.
-            let loop_col = ((x >> 3) >> sub_x) << sub_x;
-            let loop_row = ((y >> 3) >> sub_y) << sub_y;
+            let (x7, y7) = if pass == PASS_VERTICAL {
+                (x0, y0 + (7 << sub_y))
+            } else {
+                (x0 + (7 << sub_x), y0)
+            };
+
+            if x7 >= 8 * frame.mi_cols || y7 >= 8 * frame.mi_rows {
+                for i in i_start..i_start + 8 {
+                    filter_single_sample_fallback(
+                        plane_buf, frame, plane, pass, row, col, edge, i, sub_x, sub_y, &geom,
+                    );
+                }
+                continue;
+            }
+
+            let loop_col0 = ((x0 >> 3) >> sub_x) << sub_x;
+            let loop_row0 = ((y0 >> 3) >> sub_y) << sub_y;
+            let loop_col7 = ((x7 >> 3) >> sub_x) << sub_x;
+            let loop_row7 = ((y7 >> 3) >> sub_y) << sub_y;
+
+            if loop_col0 != loop_col7 || loop_row0 != loop_row7 {
+                for i in i_start..i_start + 8 {
+                    filter_single_sample_fallback(
+                        plane_buf, frame, plane, pass, row, col, edge, i, sub_x, sub_y, &geom,
+                    );
+                }
+                continue;
+            }
+
+            let loop_col = loop_col0;
+            let loop_row = loop_row0;
             let idx = loop_row as usize * frame.mi_cols as usize + loop_col as usize;
 
-            // Steps 4-5 (lines 5534-5535): MiSize / tx_size.
             let mi_size = frame.mi_sizes[idx];
             let tx_size = frame.tx_sizes[idx];
-
-            // Step 6 (line 5537): txSz = (plane > 0) ? get_uv_tx_size( )
-            // : tx_size, with §6.4.22 reading the MiSize / tx_size at
-            // (loopRow, loopCol) and the frame subsampling.
             let tx_sz = if plane > 0 {
                 get_uv_tx_size(
                     u32::from(tx_size),
@@ -336,49 +957,49 @@ pub fn superblock_loop_filter(
                 tx_size
             };
 
-            // Steps 7-14 (lines 5538-5578): the round-274 predicate
-            // bundle (isBlockEdge / isTxEdge / is32Edge / onScreen /
-            // applyFilter).
             let mi = SuperblockFilterMi {
                 mi_size,
                 tx_sz,
                 skip: frame.skips[idx],
                 ref_frame_0: frame.ref_frames_0[idx],
             };
-            let e = superblock_filter_edge(
-                pass,
-                row,
-                col,
-                edge,
-                i,
-                sub_x,
-                sub_y,
-                frame.mi_cols,
-                frame.mi_rows,
-                &mi,
+
+            let e0 = superblock_filter_edge(
+                pass, row, col, edge, i_start, sub_x, sub_y, frame.mi_cols, frame.mi_rows, &mi,
             );
-            if !e.apply_filter {
-                // Step 17's applyFilter == 1 gate: steps 15-16 are
-                // pure derivations with no other consumer, so the
-                // whole tail is skipped.
+            let e7 = superblock_filter_edge(
+                pass, row, col, edge, i_start + 7, sub_x, sub_y, frame.mi_cols, frame.mi_rows, &mi,
+            );
+
+            if !e0.apply_filter && !e7.apply_filter {
+                continue;
+            }
+            if e0.apply_filter != e7.apply_filter {
+                for i in i_start..i_start + 8 {
+                    filter_single_sample_fallback(
+                        plane_buf, frame, plane, pass, row, col, edge, i, sub_x, sub_y, &geom,
+                    );
+                }
                 continue;
             }
 
-            // Step 15 (lines 5579-5581): filterSize via §8.8.3.
-            let f_size = filter_size(
-                tx_sz,
-                e.is_32_edge,
-                pass,
-                e.x,
-                e.y,
-                sub_x as u8,
-                sub_y as u8,
-                frame.mi_cols,
-                frame.mi_rows,
+            let f_size0 = filter_size(
+                tx_sz, e0.is_32_edge, pass, e0.x, e0.y, sub_x as u8, sub_y as u8, frame.mi_cols, frame.mi_rows,
+            );
+            let f_size7 = filter_size(
+                tx_sz, e7.is_32_edge, pass, e7.x, e7.y, sub_x as u8, sub_y as u8, frame.mi_cols, frame.mi_rows,
             );
 
-            // Step 16 (lines 5582-5583): lvl / limit / blimit / thresh
-            // via §8.8.4 at (loopRow, loopCol).
+            if f_size0 != f_size7 {
+                for i in i_start..i_start + 8 {
+                    filter_single_sample_fallback(
+                        plane_buf, frame, plane, pass, row, col, edge, i, sub_x, sub_y, &geom,
+                    );
+                }
+                continue;
+            }
+
+            let f_size = f_size0;
             let strength = adaptive_filter_strength(
                 frame.lvl_lookup,
                 frame.segment_ids[idx] as usize,
@@ -388,23 +1009,68 @@ pub fn superblock_loop_filter(
             )
             .expect("§8.8.4: segment_id must be < 8 and ref_frame in 0..=3");
 
-            // Step 17 (lines 5584-5586): if applyFilter == 1 and
-            // lvl > 0, run §8.8.5 at (x >> subX, y >> subY) along
-            // (dx, dy).
-            if strength.lvl > 0 {
-                let px = i64::from(e.x >> sub_x);
-                let py = i64::from(e.y >> sub_y);
-                let (dx, dy) = (i64::from(geom.dx), i64::from(geom.dy));
-                let stencil = gather_stencil(plane_buf, px, py, dx, dy);
-                let out = sample_filtering(
-                    &stencil,
-                    strength.limit,
-                    strength.blimit,
-                    strength.thresh,
-                    f_size,
-                    frame.bit_depth,
-                );
-                scatter_stencil(plane_buf, px, py, dx, dy, &out);
+            if strength.lvl == 0 {
+                continue;
+            }
+
+            let px = (e0.x >> sub_x) as usize;
+            let py = (e0.y >> sub_y) as usize;
+
+            let in_bounds = if pass == PASS_VERTICAL {
+                let x_ok = if f_size >= TX_16X16 {
+                    px >= 8 && px + 8 <= plane_buf.width
+                } else {
+                    px >= 4 && px + 4 <= plane_buf.width
+                };
+                x_ok && (py + 8 <= plane_buf.height)
+            } else {
+                let y_ok = if f_size >= TX_16X16 {
+                    py >= 8 && py + 8 <= plane_buf.height
+                } else {
+                    py >= 4 && py + 4 <= plane_buf.height
+                };
+                y_ok && (px + 8 <= plane_buf.width)
+            };
+
+            if !in_bounds {
+                for i in i_start..i_start + 8 {
+                    filter_single_sample_fallback(
+                        plane_buf, frame, plane, pass, row, col, edge, i, sub_x, sub_y, &geom,
+                    );
+                }
+                continue;
+            }
+
+            let shift = (frame.bit_depth - 8) as u32;
+            let limit_bd = (strength.limit as i32) << shift;
+            let blimit_bd = (strength.blimit as i32) << shift;
+            let thresh_bd = (strength.thresh as i32) << shift;
+            let thresh_1 = 1_i32 << shift;
+
+            if pass == PASS_VERTICAL {
+                match f_size {
+                    TX_16X16 => filter_edge_vertical_16(
+                        plane_buf.data, plane_buf.stride, px, py, limit_bd, blimit_bd, thresh_bd, thresh_1, frame.bit_depth,
+                    ),
+                    TX_8X8 => filter_edge_vertical_8(
+                        plane_buf.data, plane_buf.stride, px, py, limit_bd, blimit_bd, thresh_bd, thresh_1, frame.bit_depth,
+                    ),
+                    _ => filter_edge_vertical_4(
+                        plane_buf.data, plane_buf.stride, px, py, limit_bd, blimit_bd, thresh_bd, frame.bit_depth,
+                    ),
+                }
+            } else {
+                match f_size {
+                    TX_16X16 => filter_edge_horizontal_16(
+                        plane_buf.data, plane_buf.stride, px, py, limit_bd, blimit_bd, thresh_bd, thresh_1, frame.bit_depth,
+                    ),
+                    TX_8X8 => filter_edge_horizontal_8(
+                        plane_buf.data, plane_buf.stride, px, py, limit_bd, blimit_bd, thresh_bd, thresh_1, frame.bit_depth,
+                    ),
+                    _ => filter_edge_horizontal_4(
+                        plane_buf.data, plane_buf.stride, px, py, limit_bd, blimit_bd, thresh_bd, frame.bit_depth,
+                    ),
+                }
             }
         }
     }
@@ -882,6 +1548,51 @@ mod tests {
         }
     }
 
+    /// 12-bit path: verifies scaling and fixed-kernel arithmetic for 12-bit pixels.
+    #[test]
+    fn bit_depth_12_step_matches_direct() {
+        let mut fx = Fixture::uniform(8, 8, BLOCK_8X8, TX_4X4, false, 0, 25);
+        fx.bit_depth = 12;
+        let mut pb = PlaneBuf::vstep(64, 64, 8, 1920, 2176);
+        superblock_loop_filter(&mut pb.view(), &fx.frame(), 0, PASS_VERTICAL, 0, 0);
+
+        let s = adaptive_filter_strength(&fx.lookup, 0, 0, 0, 0).unwrap();
+        let out = sample_filtering(
+            &two_level_stencil(1920, 2176),
+            s.limit,
+            s.blimit,
+            s.thresh,
+            TX_4X4,
+            12,
+        );
+        assert_ne!(out.q0, 2176);
+        for y in 0..64 {
+            assert_eq!(pb.get(7, y), out.p0, "row {y}");
+            assert_eq!(pb.get(8, y), out.q0, "row {y}");
+        }
+    }
+
+    /// TX_16X16 wide filter on flat step: 14 mutated outputs matching direct wide filter.
+    #[test]
+    fn tx_16x16_wide_filter_matches_direct() {
+        let fx = Fixture::uniform(8, 8, BLOCK_64X64, crate::filter_size::TX_16X16, false, 0, 25);
+        let mut pb = PlaneBuf::vstep(64, 64, 16, 127, 129);
+        superblock_loop_filter(&mut pb.view(), &fx.frame(), 0, PASS_VERTICAL, 0, 0);
+
+        let s = adaptive_filter_strength(&fx.lookup, 0, 0, 0, 0).unwrap();
+        let out = sample_filtering(
+            &two_level_stencil(127, 129),
+            s.limit,
+            s.blimit,
+            s.thresh,
+            crate::filter_size::TX_16X16,
+            8,
+        );
+        for y in 0..64 {
+            assert_eq!(pb.get(15, y), out.p0, "row {y}");
+            assert_eq!(pb.get(16, y), out.q0, "row {y}");
+        }
+    }
     /// Per-MI arrays shorter than MiRows * MiCols are rejected up
     /// front.
     #[test]

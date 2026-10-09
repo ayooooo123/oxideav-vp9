@@ -186,6 +186,7 @@ pub struct WideFilterOutput {
 }
 
 /// §3 `Clip3( a, b, x ) = a if x < a; b if x > b; x otherwise.`
+#[allow(dead_code)]
 #[inline]
 fn clip3(a: i32, b: i32, x: i32) -> i32 {
     if x < a {
@@ -200,6 +201,7 @@ fn clip3(a: i32, b: i32, x: i32) -> i32 {
 /// §3 `Round2( x, n ) = (x + (1 << (n - 1))) >> n` — symmetric
 /// half-up rounding for non-negative accumulator `t`. Required by
 /// §8.8.5.3 line 5882.
+#[allow(dead_code)]
 #[inline]
 fn round2(x: i32, n: u32) -> i32 {
     (x + (1 << (n - 1))) >> n
@@ -222,6 +224,7 @@ fn round2(x: i32, n: u32) -> i32 {
 /// And `p0 = CurrFrame[ ][ y-dy ][ x-dx ]` so position `k = -1` is
 /// `p0`. `p1` at `y-dy*2` → position `k = -2`. So position `k = -j`
 /// for `j >= 1` is `p{j-1}`.
+#[allow(dead_code)]
 #[inline]
 fn sample_at(s: &WideFilterSamples, k: i32) -> i32 {
     match k {
@@ -307,88 +310,68 @@ pub fn wide_filter(
         log2_size == 3 || log2_size == 4,
         "§8.8.5.3: log2_size must be 3 or 4 per §8.8.5 dispatch table"
     );
-
-    // §8.8.5.3 line 5864-5865 — `n = (1 << (log2Size - 1)) - 1`.
-    // log2Size = 3 → n = 3; log2Size = 4 → n = 7.
-    let n: i32 = (1 << (log2_size - 1)) - 1;
-
-    // §8.8.5.3 line 5868 outer loop — store `F[i]` for `i ∈ [-n,
-    // n-1]`. Width 14 covers the largest case (log2_size == 4, n ==
-    // 7). For log2_size == 3 only positions [-3, 2] are filled.
-    let mut f = [0_i32; 14];
-
-    for i in -n..n {
-        // §8.8.5.3 line 5869 — `t = CurrFrame[ plane ][ y+i*dy ][
-        // x+i*dx ]`. Index `i` into the §8.8.5.1 sample mapping at
-        // lines 5703-5727 (position `0` is `q0`, position `-1` is
-        // `p0`, etc.).
-        let mut t = sample_at(samples, i);
-
-        // §8.8.5.3 lines 5878-5881 — accumulate `2n+1` clamped
-        // samples. Together with the initial `t` that's `2n+2` total
-        // samples, matching `Round2( t, log2Size )` = `(t + (1 <<
-        // (log2Size-1))) >> log2Size` to renormalise into a
-        // unity-gain low-pass.
-        for j in -n..=n {
-            // §8.8.5.3 line 5879 — `p = Clip3( -(n+1), n, i+j )`.
-            // The clamp extends `p` by one sample beyond the
-            // outermost mutated position so the kernel can pull in
-            // edge-replicated samples (`p{n}` and `q{n}` are
-            // duplicated when `i+j` would exceed the range).
-            let p = clip3(-(n + 1), n, i + j);
-            t += sample_at(samples, p);
-        }
-
-        // §8.8.5.3 line 5882 — `F[ i ] = Round2( t, log2Size )`.
-        // Renormalises the `2n+2` summed samples down to a single
-        // output. The index translation `i - (-n) == i + n` lands
-        // the value at slot `0` for `i == -n`, slot `2n-1` for `i
-        // == n-1`.
-        f[(i + n) as usize] = round2(t, log2_size);
-    }
-
-    // Pack the §8.8.5.3 outputs into a position-keyed struct.
-    // Position-to-field mapping (mirrors `sample_at`):
-    //   k = -7 → op6, k = -6 → op5, ..., k = -1 → op0,
-    //   k =  0 → oq0, k =  1 → oq1, ..., k =  6 → oq6.
-    // For log2_size == 3, only positions [-3, 2] are populated by
-    // the loop; the remaining slots echo the corresponding input
-    // samples so the caller can unconditionally write all 14 fields.
+    // §8.8.5.3 fixed-tap algebraic sums — identical to the spec loop
+    // `t = CurrFrame[i] + sum_{j=-n..n} CurrFrame[Clip3(-(n+1), n, i+j)]`
+    // without dynamic indexing or clamped summation.
     if log2_size == 3 {
+        let p3 = samples.p3;
+        let p2 = samples.p2;
+        let p1 = samples.p1;
+        let p0 = samples.p0;
+        let q0 = samples.q0;
+        let q1 = samples.q1;
+        let q2 = samples.q2;
+        let q3 = samples.q3;
+
         WideFilterOutput {
             op6: samples.p6,
             op5: samples.p5,
             op4: samples.p4,
             op3: samples.p3,
-            op2: f[0], // i = -3 → slot 0
-            op1: f[1], // i = -2 → slot 1
-            op0: f[2], // i = -1 → slot 2
-            oq0: f[3], // i =  0 → slot 3
-            oq1: f[4], // i =  1 → slot 4
-            oq2: f[5], // i =  2 → slot 5
+            op2: (p3 * 3 + p2 * 2 + p1 + p0 + q0 + 4) >> 3,
+            op1: (p3 * 2 + p2 + p1 * 2 + p0 + q0 + q1 + 4) >> 3,
+            op0: (p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + 4) >> 3,
+            oq0: (p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + 4) >> 3,
+            oq1: (p1 + p0 + q0 + q1 * 2 + q2 + q3 * 2 + 4) >> 3,
+            oq2: (p0 + q0 + q1 + q2 * 2 + q3 * 3 + 4) >> 3,
             oq3: samples.q3,
             oq4: samples.q4,
             oq5: samples.q5,
             oq6: samples.q6,
         }
     } else {
-        // log2_size == 4, n == 7. Positions [-7, 6] populate slots
-        // [0, 13].
+        let p7 = samples.p7;
+        let p6 = samples.p6;
+        let p5 = samples.p5;
+        let p4 = samples.p4;
+        let p3 = samples.p3;
+        let p2 = samples.p2;
+        let p1 = samples.p1;
+        let p0 = samples.p0;
+        let q0 = samples.q0;
+        let q1 = samples.q1;
+        let q2 = samples.q2;
+        let q3 = samples.q3;
+        let q4 = samples.q4;
+        let q5 = samples.q5;
+        let q6 = samples.q6;
+        let q7 = samples.q7;
+
         WideFilterOutput {
-            op6: f[0],  // i = -7 → slot 0
-            op5: f[1],  // i = -6 → slot 1
-            op4: f[2],  // i = -5 → slot 2
-            op3: f[3],  // i = -4 → slot 3
-            op2: f[4],  // i = -3 → slot 4
-            op1: f[5],  // i = -2 → slot 5
-            op0: f[6],  // i = -1 → slot 6
-            oq0: f[7],  // i =  0 → slot 7
-            oq1: f[8],  // i =  1 → slot 8
-            oq2: f[9],  // i =  2 → slot 9
-            oq3: f[10], // i =  3 → slot 10
-            oq4: f[11], // i =  4 → slot 11
-            oq5: f[12], // i =  5 → slot 12
-            oq6: f[13], // i =  6 → slot 13
+            op6: (p7 * 7 + p6 * 2 + p5 + p4 + p3 + p2 + p1 + p0 + q0 + 8) >> 4,
+            op5: (p7 * 6 + p6 + p5 * 2 + p4 + p3 + p2 + p1 + p0 + q0 + q1 + 8) >> 4,
+            op4: (p7 * 5 + p6 + p5 + p4 * 2 + p3 + p2 + p1 + p0 + q0 + q1 + q2 + 8) >> 4,
+            op3: (p7 * 4 + p6 + p5 + p4 + p3 * 2 + p2 + p1 + p0 + q0 + q1 + q2 + q3 + 8) >> 4,
+            op2: (p7 * 3 + p6 + p5 + p4 + p3 + p2 * 2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 + 8) >> 4,
+            op1: (p7 * 2 + p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 + q0 + q1 + q2 + q3 + q4 + q5 + 8) >> 4,
+            op0: (p7 + p6 + p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 + q1 + q2 + q3 + q4 + q5 + q6 + 8) >> 4,
+            oq0: (p6 + p5 + p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 + q2 + q3 + q4 + q5 + q6 + q7 + 8) >> 4,
+            oq1: (p5 + p4 + p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 + q3 + q4 + q5 + q6 + q7 * 2 + 8) >> 4,
+            oq2: (p4 + p3 + p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 + q4 + q5 + q6 + q7 * 3 + 8) >> 4,
+            oq3: (p3 + p2 + p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 + q5 + q6 + q7 * 4 + 8) >> 4,
+            oq4: (p2 + p1 + p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 + q6 + q7 * 5 + 8) >> 4,
+            oq5: (p1 + p0 + q0 + q1 + q2 + q3 + q4 + q5 * 2 + q6 + q7 * 6 + 8) >> 4,
+            oq6: (p0 + q0 + q1 + q2 + q3 + q4 + q5 + q6 * 2 + q7 * 7 + 8) >> 4,
         }
     }
 }

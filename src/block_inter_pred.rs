@@ -293,6 +293,85 @@ pub(crate) fn block_inter_predict_plane(
     debug_assert!(w > 0 && h > 0, "block dimensions must be non-zero");
 
     let filter = &SUBPEL_FILTERS[interp_filter];
+    // Fast path: unscaled reference (x_step == 16, y_step == 16)
+    if x_step == 16 && y_step == 16 {
+        let phase_x = (x & SUBPEL_MASK) as usize;
+        let phase_y = (y & SUBPEL_MASK) as usize;
+        let base_x = (x >> 4) as usize;
+        let base_y = (y >> 4) as usize;
+
+        // When phase_x == 0 and phase_y == 0 (integer MV), filter phase 0 is
+        // [0, 0, 0, 128, 0, 0, 0, 0] which is exact identity.
+        // If entirely in-bounds, copy rectangular block directly!
+        if phase_x == 0
+            && phase_y == 0
+            && x >= 0
+            && (x >> 4) + w as i32 <= last_x + 1
+            && y >= 0
+            && (y >> 4) + h as i32 <= last_y + 1
+        {
+            let mut pred = vec![0i32; h * w];
+            for r in 0..h {
+                let src_offset = (base_y + r) * stride + base_x;
+                pred[r * w..(r + 1) * w].copy_from_slice(&samples[src_offset..src_offset + w]);
+            }
+            return pred;
+        }
+
+        let taps_x = &filter[phase_x];
+        let taps_y = &filter[phase_y];
+        let intermediate_height = h + 7;
+
+        // Use stack buffer for unscaled block to eliminate heap allocation
+        const STACK_INTERMEDIATE_CAP: usize = 4608; // (64 + 7) * 64 = 4544
+        let needed = intermediate_height * w;
+        let mut stack_intermediate = [0i32; STACK_INTERMEDIATE_CAP];
+        let mut heap_intermediate;
+        let intermediate: &mut [i32] = if needed <= STACK_INTERMEDIATE_CAP {
+            &mut stack_intermediate[..needed]
+        } else {
+            heap_intermediate = vec![0i32; needed];
+            &mut heap_intermediate[..]
+        };
+
+        for r in 0..intermediate_height {
+            let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - 3) as usize;
+            let row = &samples[ref_row * stride..ref_row * stride + (last_x as usize + 1)];
+            let out = &mut intermediate[r * w..(r + 1) * w];
+            let base_col_start = (x >> 4) - 3;
+
+            for (c, slot) in out.iter_mut().enumerate() {
+                let base_col = base_col_start + c as i32;
+                let mut s = 0i32;
+                if base_col >= 0 && base_col + 7 <= last_x {
+                    let win = &row[base_col as usize..base_col as usize + 8];
+                    for (&tap, &v) in taps_x.iter().zip(win) {
+                        s += tap * v;
+                    }
+                } else {
+                    for (t, &tap) in taps_x.iter().enumerate() {
+                        let ref_col = clip3(0, last_x, base_col + t as i32);
+                        s += tap * row[ref_col as usize];
+                    }
+                }
+                *slot = clip1(round2(s, 7), bit_depth);
+            }
+        }
+
+        let mut pred = vec![0i32; h * w];
+        for r in 0..h {
+            let base_row = r;
+            let out = &mut pred[r * w..(r + 1) * w];
+            for (c, slot) in out.iter_mut().enumerate() {
+                let mut s = 0i32;
+                for (t, &tap) in taps_y.iter().enumerate() {
+                    s += tap * intermediate[(base_row + t) * w + c];
+                }
+                *slot = clip1(round2(s, 7), bit_depth);
+            }
+        }
+        return pred;
+    }
     let intermediate_height = ((((h as i32 - 1) * y_step + 15) >> 4) + 8) as usize;
 
     let mut intermediate = vec![0i32; intermediate_height * w];
