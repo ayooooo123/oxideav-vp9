@@ -25,6 +25,9 @@ All notable changes to `oxideav-vp9` are recorded here.
   (planes G, B, R) instead of the `Yuv444P*` family;
   `Vp9Decoder::pixel_format( )` now describes the frame most recently
   returned (before the first: the first keyframe submitted).
+- Retain the fork's returned-frame dimension hook over that same emitted
+  description. A reset keeps the last output shape so the first different
+  post-seek frame advances the generation instead of hiding the change.
 
 ### Performance
 

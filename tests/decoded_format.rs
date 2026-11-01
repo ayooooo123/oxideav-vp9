@@ -114,7 +114,9 @@ fn each_frame_reports_its_own_size_and_layout() {
         assert_eq!(seen, expected.len(), "frames at {threads} threads");
         assert_eq!(report(&dec), expected.last().copied(), "after drain");
         dec.reset().expect("reset");
-        assert_eq!(report(&dec), None, "after reset");
+        // Preserve the emitted shape across a seek so the next different
+        // shape can advance output_params_generation, as upstream specifies.
+        assert_eq!(report(&dec), expected.last().copied(), "after reset");
     }
 }
 
