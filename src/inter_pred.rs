@@ -350,7 +350,17 @@ pub(crate) fn predict_inter_with(
             let data = dst.samples_mut();
             for i in 0..h {
                 let o = &mut data[(py + i) * pw + px..][..w];
-                for (o, &b) in o.iter_mut().zip(&preds[1][i * w..(i + 1) * w]) {
+                let p1 = &preds[1][i * w..(i + 1) * w];
+                #[cfg(any(
+                    target_arch = "aarch64",
+                    all(target_arch = "wasm32", target_feature = "simd128")
+                ))]
+                crate::simd_lf::avg_round2_u16_i32(o, p1);
+                #[cfg(not(any(
+                    target_arch = "aarch64",
+                    all(target_arch = "wasm32", target_feature = "simd128")
+                )))]
+                for (o, &b) in o.iter_mut().zip(p1) {
                     *o = round2(i32::from(*o) + b, 1) as u16;
                 }
             }

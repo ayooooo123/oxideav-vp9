@@ -51,7 +51,10 @@
 // exclusively from `#[cfg(test)]`.
 #![allow(dead_code)]
 
-use crate::idct::{ADST_ADST, ADST_DCT, DCT_ADST, DCT_DCT, inverse_transform_2d};
+use crate::idct::{
+    ADST_ADST, ADST_DCT, COS64_LOOKUP, DCT_ADST, DCT_DCT, inverse_transform_2d,
+    inverse_transform_2d_masked,
+};
 use crate::intra::{Plane, PredMode, predict_intra};
 
 /// `mode2txfm_map[ MB_MODE_COUNT ]` from §10.5 — the intra prefix of the
@@ -201,6 +204,171 @@ fn reconstruct_n<const SQ: usize>(
         let out = &mut data[(y + i) * pw + x..][..cols];
         for (o, &r) in out.iter_mut().zip(res) {
             *o = (i64::from(*o) + r).clamp(0, max) as u16;
+        }
+    }
+}
+
+#[inline(always)]
+fn add_dc_row(out: &mut [u16], dc: i32, max: i32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        let end8 = out.len() & !7;
+        let d_lo = vdupq_n_s32(dc);
+        let top = vdup_n_u16(max as u16);
+        let mut x = 0;
+        while x < end8 {
+            let p = out.as_mut_ptr().add(x);
+            let u = vld1q_u16(p);
+            let lo = vaddq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(u))), d_lo);
+            let hi = vaddq_s32(vreinterpretq_s32_u32(vmovl_high_u16(u)), d_lo);
+            let r_lo = vmin_u16(vqmovun_s32(lo), top);
+            let r_hi = vmin_u16(vqmovun_s32(hi), top);
+            vst1q_u16(p, vcombine_u16(r_lo, r_hi));
+            x += 8;
+        }
+        for o in &mut out[end8..] {
+            *o = (i32::from(*o) + dc).clamp(0, max) as u16;
+        }
+        return;
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    unsafe {
+        use core::arch::wasm32::*;
+        let end8 = out.len() & !7;
+        let dv = i32x4_splat(dc);
+        let zv = i32x4_splat(0);
+        let tv = i32x4_splat(max);
+        let mut x = 0;
+        while x < end8 {
+            let p = out.as_mut_ptr().add(x);
+            let u = v128_load(p.cast());
+            let lo = i32x4_min(i32x4_max(i32x4_add(u32x4_extend_low_u16x8(u), dv), zv), tv);
+            let hi = i32x4_min(i32x4_max(i32x4_add(u32x4_extend_high_u16x8(u), dv), zv), tv);
+            v128_store(p.cast(), u16x8_narrow_i32x4(lo, hi));
+            x += 8;
+        }
+        for o in &mut out[end8..] {
+            *o = (i32::from(*o) + dc).clamp(0, max) as u16;
+        }
+        return;
+    }
+    #[allow(unreachable_code)]
+    for o in out {
+        *o = (i32::from(*o) + dc).clamp(0, max) as u16;
+    }
+}
+
+/// Fast sparse reconstruction for [`ReconLog`] replay: avoids scattering into a
+/// 1024-entry token array, eliminates 1024 divisions per 32×32 block, and
+/// evaluates DC-only `DCT_DCT` blocks in O(1) without allocating `dequant`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_sparse(
+    plane_buf: &mut Plane,
+    x: usize,
+    y: usize,
+    tx_sz: u32,
+    coefs: &[(u16, i32)],
+    dc_quant: i32,
+    ac_quant: i32,
+    tx_type: u8,
+    lossless: bool,
+    bit_depth: u32,
+) {
+    if coefs.is_empty() {
+        return;
+    }
+    let (pw, ph) = (plane_buf.width(), plane_buf.height());
+    if x >= pw || y >= ph {
+        return;
+    }
+    let n = 2 + tx_sz;
+    let n0 = 1usize << n;
+    let cols = n0.min(pw - x);
+    let rows = n0.min(ph - y);
+    let max = (1i32 << bit_depth) - 1;
+    let dq_shift = u32::from(tx_sz == 3);
+
+    // O(1) DC-only DCT_DCT fast path (covers ~60% of coded VP9 transform blocks).
+    if !lossless && tx_type == DCT_DCT && coefs.len() == 1 && coefs[0].0 == 0 {
+        let dc_tok = i64::from(coefs[0].1) * i64::from(dc_quant);
+        let dc_dq = if dq_shift != 0 { dc_tok / 2 } else { dc_tok };
+        let c = COS64_LOOKUP[16];
+        let r1 = (dc_dq * c + 8192) >> 14;
+        let r2 = (r1 * c + 8192) >> 14;
+        let shift = core::cmp::min(6, n + 2);
+        let dc_res = ((r2 + (1 << (shift - 1))) >> shift) as i32;
+        if dc_res != 0 {
+            let data = plane_buf.samples_mut();
+            for i in 0..rows {
+                add_dc_row(&mut data[(y + i) * pw + x..][..cols], dc_res, max);
+            }
+        }
+        return;
+    }
+
+    match tx_sz {
+        0 => reconstruct_sparse_n::<16>(
+            plane_buf, x, y, n, coefs, dc_quant, ac_quant, tx_type, lossless, cols, rows, max,
+        ),
+        1 => reconstruct_sparse_n::<64>(
+            plane_buf, x, y, n, coefs, dc_quant, ac_quant, tx_type, lossless, cols, rows, max,
+        ),
+        2 => reconstruct_sparse_n::<256>(
+            plane_buf, x, y, n, coefs, dc_quant, ac_quant, tx_type, lossless, cols, rows, max,
+        ),
+        _ => reconstruct_sparse_n::<1024>(
+            plane_buf, x, y, n, coefs, dc_quant, ac_quant, tx_type, lossless, cols, rows, max,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn reconstruct_sparse_n<const SQ: usize>(
+    plane_buf: &mut Plane,
+    x: usize,
+    y: usize,
+    n: u32,
+    coefs: &[(u16, i32)],
+    dc_quant: i32,
+    ac_quant: i32,
+    tx_type: u8,
+    lossless: bool,
+    cols: usize,
+    rows: usize,
+    max: i32,
+) {
+    let n0 = 1usize << n;
+    let mut dequant = [0i64; SQ];
+    let mut row_mask = 0u32;
+    let ac = i64::from(ac_quant);
+    let dc = i64::from(dc_quant);
+    if n == 5 {
+        for &(pos, val) in coefs {
+            let p = pos as usize;
+            let q = if p == 0 { dc } else { ac };
+            dequant[p] = (i64::from(val) * q) / 2;
+            row_mask |= 1u32 << (p >> n);
+        }
+    } else {
+        for &(pos, val) in coefs {
+            let p = pos as usize;
+            let q = if p == 0 { dc } else { ac };
+            dequant[p] = i64::from(val) * q;
+            row_mask |= 1u32 << (p >> n);
+        }
+    }
+
+    inverse_transform_2d_masked(&mut dequant, n, tx_type, lossless, row_mask);
+
+    let max64 = i64::from(max);
+    let pw = plane_buf.width();
+    let data = plane_buf.samples_mut();
+    for (i, res) in dequant.chunks_exact(n0).take(rows).enumerate() {
+        let out = &mut data[(y + i) * pw + x..][..cols];
+        for (o, &r) in out.iter_mut().zip(res) {
+            *o = (i64::from(*o) + r).clamp(0, max64) as u16;
         }
     }
 }

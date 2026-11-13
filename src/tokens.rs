@@ -315,6 +315,7 @@ pub(crate) const PARETO_TABLE: [[u8; 8]; 128] = [
 /// row index is implicitly clamped to `0..=127` (a `prob = 0` case
 /// never arises in conformant streams: the §10 default tables and
 /// §6.3.5 `inv_remap_prob` both produce values in `1..=255`).
+#[inline(always)]
 pub(crate) fn pareto(node: u32, prob: u8) -> u8 {
     if node < 2 {
         return prob;
@@ -346,6 +347,7 @@ pub(crate) fn pareto(node: u32, prob: u8) -> u8 {
 /// per the spec — that is, the node-0 unconstrained probability for
 /// the running context. Caller is responsible for picking the right
 /// cell out of the §6.3.7 table.
+#[inline(always)]
 pub(crate) fn read_more_coefs(coder: &mut BoolCoder<'_>, prob: u8) -> Result<bool, Error> {
     let v = coder.read_bool(prob as u32)?;
     Ok(v == 1)
@@ -387,6 +389,7 @@ pub(crate) fn read_more_coefs(coder: &mut BoolCoder<'_>, prob: u8) -> Result<boo
 /// `node >= 1` uses `coef_probs[...][2]` as the input to `pareto`;
 /// the round-7 walker accepts the full pre-computed probability
 /// array so the round-7 driver doesn't need to call `pareto` inline.
+#[inline(always)]
 pub(crate) fn read_token(coder: &mut BoolCoder<'_>, probs: &[u8; 10]) -> Result<u32, Error> {
     let mut n: i32 = 0;
     loop {
@@ -409,7 +412,7 @@ pub(crate) fn read_token(coder: &mut BoolCoder<'_>, probs: &[u8; 10]) -> Result<
 /// deriving each §9.3 node probability only when the tree walk reaches
 /// it (node 0 reads `cell[ 1 ]`, node 1 `cell[ 2 ]`, deeper nodes the
 /// Pareto extension of `cell[ 2 ]`).
-#[inline]
+#[inline(always)]
 pub(crate) fn read_token_cell(coder: &mut BoolCoder<'_>, cell: &[u8; 3]) -> Result<u32, Error> {
     let mut n: i32 = 0;
     loop {
@@ -442,6 +445,7 @@ pub(crate) fn read_token_cell(coder: &mut BoolCoder<'_>, cell: &[u8; 3]) -> Resu
 ///
 /// Returns the unsigned magnitude (≥ 1). The caller folds in the
 /// `sign_bit` `L(1)` read separately.
+#[inline(always)]
 pub(crate) fn read_coef(
     coder: &mut BoolCoder<'_>,
     token: u32,

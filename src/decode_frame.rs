@@ -78,7 +78,7 @@ use crate::partition::{
     LeafSink, PartitionContextState, PartitionProbsKind, decode_partition, get_tile_offset,
     tile_payload_sizes,
 };
-use crate::reconstruct::{reconstruct_block, tx_type_for_intra};
+use crate::reconstruct::{reconstruct_block, reconstruct_sparse, tx_type_for_intra};
 use crate::ref_buffer::{REFS_PER_FRAME, RefBuffers};
 use crate::residual::{
     BLOCK_8X8, BLOCK_64X64, BLOCK_INVALID, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
@@ -1335,7 +1335,7 @@ fn replay(
     ctx: &PixelCtx<'_>,
     planes: [&mut Plane; 3],
     pred: &mut crate::inter_pred::PredScratch,
-    tok_buf: &mut [i64; 1024],
+    _tok_buf: &mut [i64; 1024],
 ) {
     let [y, u, v] = planes;
     for op in &log.ops {
@@ -1363,27 +1363,20 @@ fn replay(
                     1 => &mut *u,
                     _ => &mut *v,
                 };
-                let n0 = 1usize << (op.tx_sz + 2);
                 let (start, len) = (op.coefs.0 as usize, op.coefs.1 as usize);
                 let coefs = &log.coefs[start..start + len];
-                for &(p, val) in coefs {
-                    tok_buf[p as usize] = i64::from(val);
-                }
-                reconstruct_block(
+                reconstruct_sparse(
                     dst,
                     usize::from(op.x),
                     usize::from(op.y),
                     u32::from(op.tx_sz),
-                    &tok_buf[..n0 * n0],
+                    coefs,
                     op.dc_quant,
                     op.ac_quant,
                     op.tx_type,
                     ctx.lossless,
                     ctx.bit_depth,
                 );
-                for &(p, _) in coefs {
-                    tok_buf[p as usize] = 0;
-                }
             }
         }
     }

@@ -79,8 +79,18 @@ impl<'a> BoolCoder<'a> {
 
     /// Top the window up to at least 49 upcoming bits (virtual zero
     /// bits past the end of `data`).
-    #[inline]
+    #[inline(always)]
     fn fill(&mut self) {
+        if self.pos + 8 <= self.data.len() && (0..=48).contains(&self.count) {
+            let chunk = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+            let add_bytes = ((56 - self.count) >> 3) as usize;
+            let add_bits = (add_bytes * 8) as i32;
+            let masked = chunk & (!0u64 << (64 - add_bits as u32));
+            self.value |= masked >> (8 + self.count as u32);
+            self.pos += add_bytes;
+            self.count += add_bits;
+            return;
+        }
         while self.count <= 48 {
             match self.data.get(self.pos) {
                 Some(&b) => {
@@ -101,7 +111,7 @@ impl<'a> BoolCoder<'a> {
     /// Returns [`Error::InvalidBitstream`] when the renormalisation
     /// would consume more than `BoolMaxBits` bits (the §9.2.2
     /// conformance requirement).
-    #[inline]
+    #[inline(always)]
     pub(crate) fn read_bool(&mut self, p: u32) -> Result<u32, Error> {
         debug_assert!(p <= 255);
         let split = 1 + (((self.range - 1) * p) >> 8);
@@ -134,6 +144,7 @@ impl<'a> BoolCoder<'a> {
 
     /// `read_literal( n )` per spec §9.2.4: `n` `read_bool( 128 )`
     /// calls, most significant bit first.
+    #[inline(always)]
     pub(crate) fn read_literal(&mut self, n: u32) -> Result<u32, Error> {
         debug_assert!(n <= 32);
         let mut x: u32 = 0;

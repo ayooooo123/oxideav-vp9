@@ -545,6 +545,7 @@ mod residual;
 mod residual_writer;
 mod sample_filtering;
 mod scan;
+mod simd_lf;
 mod superblock_filter;
 mod superblock_loop_filter;
 mod superframe;

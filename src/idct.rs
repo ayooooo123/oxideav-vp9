@@ -85,22 +85,33 @@ pub(crate) fn brev(num_bits: u32, x: usize) -> usize {
 
 /// `cos64( angle )` from §8.7.1.1 — `round( 16384 * cos( angle*pi/64 ) )`
 /// realised via the 33-entry quarter-wave [`COS64_LOOKUP`] table.
-pub(crate) fn cos64(angle: i32) -> i64 {
-    let angle2 = (angle & 127) as usize;
-    if angle2 <= 32 {
-        COS64_LOOKUP[angle2]
-    } else if angle2 <= 64 {
-        -COS64_LOOKUP[64 - angle2]
-    } else if angle2 <= 96 {
-        -COS64_LOOKUP[angle2 - 64]
-    } else {
-        COS64_LOOKUP[128 - angle2]
+const COS128: [i64; 128] = {
+    let mut t = [0i64; 128];
+    let mut a = 0usize;
+    while a < 128 {
+        t[a] = if a <= 32 {
+            COS64_LOOKUP[a]
+        } else if a <= 64 {
+            -COS64_LOOKUP[64 - a]
+        } else if a <= 96 {
+            -COS64_LOOKUP[a - 64]
+        } else {
+            COS64_LOOKUP[128 - a]
+        };
+        a += 1;
     }
+    t
+};
+
+#[inline(always)]
+pub(crate) fn cos64(angle: i32) -> i64 {
+    COS128[(angle & 127) as usize]
 }
 
 /// `sin64( angle )` from §8.7.1.1, defined as `cos64( angle - 32 )`.
+#[inline(always)]
 pub(crate) fn sin64(angle: i32) -> i64 {
-    cos64(angle - 32)
+    COS128[((angle - 32) & 127) as usize]
 }
 
 /// §8.7.1.1 butterfly rotation `B( a, b, angle, flip )` over the array
@@ -506,6 +517,23 @@ pub(crate) fn inverse_transform_2d(dequant: &mut [i64], n: u32, tx_type: u8, los
     }
 }
 
+/// Sparse-aware §8.7.2 2D inverse transform using `row_mask` (bit `r` set iff row `r` has a non-zero coefficient).
+#[inline(always)]
+pub(crate) fn inverse_transform_2d_masked(
+    dequant: &mut [i64],
+    n: u32,
+    tx_type: u8,
+    lossless: bool,
+    row_mask: u32,
+) {
+    match n {
+        2 => inverse_transform_2d_n_masked::<2>(dequant, tx_type, lossless, row_mask),
+        3 => inverse_transform_2d_n_masked::<3>(dequant, tx_type, lossless, row_mask),
+        4 => inverse_transform_2d_n_masked::<4>(dequant, tx_type, lossless, row_mask),
+        _ => inverse_transform_2d_n_masked::<5>(dequant, tx_type, lossless, row_mask),
+    }
+}
+
 /// The spec-literal §8.7.2 driver over the recursive §8.7.1 processes
 /// — the oracle the fast [`inverse_transform_2d`] is pinned against.
 #[cfg(test)]
@@ -719,21 +747,39 @@ fn apply_1d_fast<const N: u32>(t: &mut [i64; 32], use_dct: bool) {
 fn inverse_transform_2d_n<const N: u32>(dequant: &mut [i64], tx_type: u8, lossless: bool) {
     let n0 = 1usize << N;
     let block = &mut dequant[..n0 * n0];
-    let shift = core::cmp::min(6, N + 2);
-
     if !lossless && tx_type == DCT_DCT && block[1..].iter().all(|&v| v == 0) {
         let c = COS64_LOOKUP[16];
         let row = round2(block[0] * c, 14);
         let col = round2(row * c, 14);
-        block.fill(round2(col, shift));
+        block.fill(round2(col, core::cmp::min(6, N + 2)));
         return;
     }
+    let mut row_mask = 0u32;
+    for (r, row) in block.chunks_exact(n0).enumerate() {
+        if row.iter().any(|&v| v != 0) {
+            row_mask |= 1u32 << r;
+        }
+    }
+    inverse_transform_2d_n_masked::<N>(block, tx_type, lossless, row_mask);
+}
 
+fn inverse_transform_2d_n_masked<const N: u32>(
+    dequant: &mut [i64],
+    tx_type: u8,
+    lossless: bool,
+    row_mask: u32,
+) {
+    if row_mask == 0 {
+        return;
+    }
+    let n0 = 1usize << N;
+    let block = &mut dequant[..n0 * n0];
+    let shift = core::cmp::min(6, N + 2);
     let row_dct = tx_type == DCT_DCT || tx_type == ADST_DCT;
     let col_dct = tx_type == DCT_DCT || tx_type == DCT_ADST;
     let mut t = [0i64; 32];
-    for row in block.chunks_exact_mut(n0) {
-        if row.iter().all(|&v| v == 0) {
+    for (r, row) in block.chunks_exact_mut(n0).enumerate() {
+        if (row_mask >> r) & 1 == 0 {
             continue;
         }
         t[..n0].copy_from_slice(row);
@@ -744,7 +790,6 @@ fn inverse_transform_2d_n<const N: u32>(dequant: &mut [i64], tx_type: u8, lossle
         }
         row.copy_from_slice(&t[..n0]);
     }
-
     for j in 0..n0 {
         for i in 0..n0 {
             t[i] = block[i * n0 + j];

@@ -471,16 +471,19 @@ pub(crate) fn block_inter_predict_into<R: SampleRows, O: Px>(
         // (edge replication — exactly the samples the per-tap clamped
         // reads return), then filter it like an interior block.
         let (fw, fh) = (w + 7, h + 7);
-        let mut emu = [0i32; 71 * 71];
+        let mut emu = [core::mem::MaybeUninit::<u16>::uninit(); 71 * 71];
         for r in 0..fh {
             let ry = (iy + r as i32 - 3).clamp(0, last_y) as usize;
             let row = rows_of.row(ry);
-            for (c, d) in emu[r * fw..(r + 1) * fw].iter_mut().enumerate() {
-                *d = row[(ix + c as i32 - 3).clamp(0, last_x) as usize].get();
+            let dst_r = &mut emu[r * fw..(r + 1) * fw];
+            for (c, d) in dst_r.iter_mut().enumerate() {
+                d.write(row[(ix + c as i32 - 3).clamp(0, last_x) as usize].get() as u16);
             }
         }
+        let emu_slice =
+            unsafe { core::slice::from_raw_parts(emu.as_ptr().cast::<u16>(), fw * fh) };
         let win = Window {
-            data: &emu[..fw * fh],
+            data: emu_slice,
             stride: fw,
             y0: 0,
         };
@@ -583,6 +586,28 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
     };
 
     if fx == 0 && fy == 0 {
+        if core::mem::size_of::<R::Px>() == 2 && core::mem::size_of::<O>() == 2 {
+            let out_u16 =
+                unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u16>(), out.len()) };
+            for r in 0..h {
+                let rp = &rows_of.row(iy + r)[ix..ix + w];
+                let src_u16 = unsafe { core::slice::from_raw_parts(rp.as_ptr().cast::<u16>(), w) };
+                out_u16[r * out_stride..r * out_stride + w].copy_from_slice(src_u16);
+            }
+            return;
+        }
+        if core::mem::size_of::<R::Px>() == 2 && core::mem::size_of::<O>() == 4 {
+            let out_i32 =
+                unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<i32>(), out.len()) };
+            for r in 0..h {
+                let rp = &rows_of.row(iy + r)[ix..ix + w];
+                let src_u16 = unsafe { core::slice::from_raw_parts(rp.as_ptr().cast::<u16>(), w) };
+                for (o, &v) in out_i32[r * out_stride..r * out_stride + w].iter_mut().zip(src_u16) {
+                    *o = i32::from(v);
+                }
+            }
+            return;
+        }
         for r in 0..h {
             let d = dst_row(out, r);
             for (o, &v) in out[d].iter_mut().zip(&rows_of.row(iy + r)[ix..ix + w]) {
@@ -602,8 +627,115 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
         ((s + 64) >> 7).clamp(0, max)
     };
 
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    if core::mem::size_of::<R::Px>() == 2 && core::mem::size_of::<O>() == 2 {
+        let out_u16 =
+            unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u16>(), out.len()) };
+        if fy == 0 {
+            let taps = &filter[fx];
+            for r in 0..h {
+                let row_px = &rows_of.row(iy + r)[ix - 3..ix + w + 4];
+                let row_u16 = unsafe {
+                    core::slice::from_raw_parts(row_px.as_ptr().cast::<u16>(), row_px.len())
+                };
+                let d = &mut out_u16[r * out_stride..r * out_stride + w];
+                let d_i16 =
+                    unsafe { core::slice::from_raw_parts_mut(d.as_mut_ptr().cast::<i16>(), w) };
+                crate::simd_lf::convolve_h_u16_to_i16(row_u16, taps, max, d_i16, w);
+            }
+            return;
+        }
+        let taps_v = &filter[fy];
+        if fx == 0 {
+            for r in 0..h {
+                let src_rows: [&[i16]; 8] = core::array::from_fn(|k| {
+                    let rp = &rows_of.row(iy + r + k - 3)[ix..ix + w];
+                    unsafe { core::slice::from_raw_parts(rp.as_ptr().cast::<i16>(), rp.len()) }
+                });
+                let d = &mut out_u16[r * out_stride..r * out_stride + w];
+                crate::simd_lf::convolve_v_i16_to_u16(src_rows, taps_v, max, d, w);
+            }
+            return;
+        }
+        let rows = h + 7;
+        let taps_h = &filter[fx];
+        let inter_i16 = unsafe {
+            core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<i16>(), rows * w)
+        };
+        for (r, dst) in inter_i16.chunks_exact_mut(w).enumerate() {
+            let row_px = &rows_of.row(iy + r - 3)[ix - 3..ix + w + 4];
+            let row_u16 =
+                unsafe { core::slice::from_raw_parts(row_px.as_ptr().cast::<u16>(), row_px.len()) };
+            crate::simd_lf::convolve_h_u16_to_i16(row_u16, taps_h, max, dst, w);
+        }
+        for r in 0..h {
+            let src_rows: [&[i16]; 8] =
+                core::array::from_fn(|k| &inter_i16[(r + k) * w..(r + k + 1) * w]);
+            let d = &mut out_u16[r * out_stride..r * out_stride + w];
+            crate::simd_lf::convolve_v_i16_to_u16(src_rows, taps_v, max, d, w);
+        }
+        return;
+    }
+
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    if core::mem::size_of::<R::Px>() == 2 && core::mem::size_of::<O>() == 4 {
+        let out_i32 =
+            unsafe { core::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<i32>(), out.len()) };
+        if fy == 0 {
+            let mut tmp = [0i16; 64];
+            let taps = &filter[fx];
+            for r in 0..h {
+                let row_px = &rows_of.row(iy + r)[ix - 3..ix + w + 4];
+                let row_u16 = unsafe {
+                    core::slice::from_raw_parts(row_px.as_ptr().cast::<u16>(), row_px.len())
+                };
+                crate::simd_lf::convolve_h_u16_to_i16(row_u16, taps, max, &mut tmp[..w], w);
+                let d = &mut out_i32[r * out_stride..r * out_stride + w];
+                for (o, &v) in d.iter_mut().zip(&tmp[..w]) {
+                    *o = i32::from(v);
+                }
+            }
+            return;
+        }
+        let taps_v = &filter[fy];
+        if fx == 0 {
+            for r in 0..h {
+                let src_rows: [&[i16]; 8] = core::array::from_fn(|k| {
+                    let rp = &rows_of.row(iy + r + k - 3)[ix..ix + w];
+                    unsafe { core::slice::from_raw_parts(rp.as_ptr().cast::<i16>(), rp.len()) }
+                });
+                let d = &mut out_i32[r * out_stride..r * out_stride + w];
+                crate::simd_lf::convolve_v_i16_to_i32(src_rows, taps_v, max, d, w);
+            }
+            return;
+        }
+        let rows = h + 7;
+        let taps_h = &filter[fx];
+        let inter_i16 = unsafe {
+            core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<i16>(), rows * w)
+        };
+        for (r, dst) in inter_i16.chunks_exact_mut(w).enumerate() {
+            let row_px = &rows_of.row(iy + r - 3)[ix - 3..ix + w + 4];
+            let row_u16 =
+                unsafe { core::slice::from_raw_parts(row_px.as_ptr().cast::<u16>(), row_px.len()) };
+            crate::simd_lf::convolve_h_u16_to_i16(row_u16, taps_h, max, dst, w);
+        }
+        for r in 0..h {
+            let src_rows: [&[i16]; 8] =
+                core::array::from_fn(|k| &inter_i16[(r + k) * w..(r + k + 1) * w]);
+            let d = &mut out_i32[r * out_stride..r * out_stride + w];
+            crate::simd_lf::convolve_v_i16_to_i32(src_rows, taps_v, max, d, w);
+        }
+        return;
+    }
+
     if fy == 0 {
-        // Horizontal only: the rows the vertical pass would copy.
         for r in 0..h {
             let d = dst_row(out, r);
             let row = &rows_of.row(iy + r)[ix - 3..ix + w + 4];
@@ -616,8 +748,6 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
 
     let taps = &filter[fy];
     if fx == 0 {
-        // Vertical only: filter the reference rows directly (no
-        // intermediate copy).
         for r in 0..h {
             let src: [&[R::Px]; 8] =
                 std::array::from_fn(|k| &rows_of.row(iy + r + k - 3)[ix..ix + w]);
@@ -633,7 +763,6 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
         return;
     }
 
-    // Intermediate rows iy - 3 .. iy + h + 4 (h + 7 rows).
     let rows = h + 7;
     let inter = &mut scratch[..rows * w];
     for (r, dst) in inter.chunks_exact_mut(w).enumerate() {

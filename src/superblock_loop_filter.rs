@@ -1114,6 +1114,26 @@ fn filter_lanes<T: Px>(
     filter_size: u8,
     bit_depth: u8,
 ) {
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ))]
+    if core::mem::size_of::<T>() == 2 && bit_depth <= 10 {
+        let u16_slice =
+            unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u16>(), data.len()) };
+        if crate::simd_lf::filter_lanes_u16(
+            u16_slice,
+            q0,
+            step,
+            along,
+            n,
+            strength,
+            filter_size,
+            bit_depth,
+        ) {
+            return;
+        }
+    }
     if bit_depth <= 10 {
         if along == 1 {
             filter_lanes_i16::<T, true>(data, q0, step, along, n, strength, filter_size, bit_depth);
