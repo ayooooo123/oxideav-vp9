@@ -86,7 +86,9 @@ fn receive_all(dec: &mut dyn Decoder, expected: &[Layout], seen: &mut usize) {
                 assert_geometry(&frame, expected[*seen], *seen);
                 *seen += 1;
             }
-            Ok(_) => panic!("non-video frame"),
+            // A new shape is announced ahead of its first shown frame.
+            Ok(Frame::StreamParams(_)) => {}
+            Ok(_) => panic!("unexpected frame kind"),
             Err(Error::NeedMore | Error::Eof) => return,
             Err(e) => panic!("receive: {e}"),
         }

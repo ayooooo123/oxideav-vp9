@@ -208,16 +208,21 @@ spawn). Per §6.4 tile column, an entropy-decode job (partition, mode
 info, motion vectors, tokens) logs each superblock row's pixel work and
 publishes the row's mode info, and a reconstruction job replays the log
 — the same §8.5 / §8.6 operations in the same order — into private
-working planes and publishes the row's pixels into its band; three
-loop-filter jobs claim the superblock rows in order, filtering each as
-soon as every column has published it, two superblocks behind the row
-above. Finished rows freeze into the shared frame in raster order (a
+working planes and publishes the row's pixels into its band. The §8.8
+loop filter trails reconstruction by superblock rows: with several tile
+columns three loop-filter jobs claim the rows in order, filtering each
+as soon as every column has published it, two superblocks behind the
+row above; a frame with one tile column filters each row inside its
+reconstruction job, right after publishing it. Finished rows freeze into the shared frame in raster order (a
 band above its last eight rows once its own filter row is done, the
 tail once the row below has filtered across their edge), so the next
 frames' inter prediction, §6.5 previous-frame motion vectors and
 §6.4.14 previous segment ids start on them while the frame is still
-decoding (the framework decoder keeps several frames in flight; frames
-drain on `flush`). Tile columns are independent by construction (§6.4.4
+decoding — **frame-level parallelism with row progress**: a frame
+blocks only on the reference rows it actually reads, which is what
+keeps a larger budget busy on streams without tile columns (the
+framework decoder keeps `1.5 x threads` frames in flight, at least 4
+and at most 8; frames drain on `flush`). Tile columns are independent by construction (§6.4.4
 `AvailL = MiCol > MiColStart`, SB64-aligned tile boundaries bounding
 every §8.5.1 edge read, §6.5 candidate scans clamped to the tile
 window), every band and slot has exactly one writer, and the §9.3.4
@@ -226,9 +231,40 @@ counts feeding §6.1.2 `refresh_probs( )` are summed, so the output is
 by unit, whole-corpus (1 / 2 / 4 / 8 / 18 / auto threads against every
 staged `expected.yuv`) and registry parity sweeps. A decode error
 restores the state the failing frame started from and replays the
-frames after it, exactly as a serial decode would. On a 1080p30 10 s
-libvpx clip (4 tile columns) the decoder runs ~1.9 s on one thread and
-~0.24 s on an 18-core machine (`examples/decode_ivf.rs`).
+frames after it, exactly as a serial decode would (pinned at 2 / 3 /
+4 / 8 threads, and by the `decode_frame_threads_diff` differential
+fuzz target).
+
+Everything is dependency-free (`std::thread`, `Mutex` / `Condvar` /
+atomics; no `unsafe`, no CPU-specific code paths — the kernels are
+plain loops the compiler vectorises for the build target), and the
+thread count is the caller's alone: `ExecutionContext::serial( )` (the
+default), `with_threads( n )`, or `auto( )`.
+
+**Decode speed** — frames per second on 120-frame streams from a
+black-box encoder (`benches/decode_sweep.sh` regenerates them and
+checks every output against a black-box decode), Apple M5 Max
+(18 cores), other builds running on the machine, median of three,
+through the framework decoder (`examples/decode_ivf.rs`); in
+parentheses the same build before round 486:
+
+| stream | 1 thread | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| 1080p 8-bit, 1 tile column, 5 Mb/s | 149 (85) | 281 (139) | 524 (150) | 765 (263) | 841 (358) |
+| 1080p 8-bit, 4 tile columns, 5 Mb/s | 142 (81) | 260 (153) | 505 (301) | 795 (435) | 1148 (665) |
+| 1080p 10-bit, 4 tile columns, 5 Mb/s | 127 (76) | 234 (145) | 460 (281) | 711 (415) | 1038 (632) |
+| 1080p 8-bit, 1 tile column, 20 Mb/s | 70 (43) | 127 (77) | 205 (93) | 287 (128) | 281 (150) |
+| 2160p 8-bit, 1 tile column, 16 Mb/s | 43 (25) | 84 (42) | 153 (44) | 231 (80) | 260 (117) |
+| 2160p 8-bit, 8 tile columns, 16 Mb/s | 36 (21) | 69 (41) | 129 (80) | 206 (136) | 329 (224) |
+| 2160p 10-bit, 8 tile columns, 16 Mb/s | 33 (20) | 62 (39) | 118 (74) | 194 (128) | 316 (192) |
+
+On that machine 1080p30 and 1080p60 are real-time on one thread
+(the 20 Mb/s stream included), 2160p30 on one thread and 2160p60 on
+two. A strict `x86-64` baseline build (`-C target-cpu=x86-64`, SSE2
+only) of the same code, run under binary translation on the same
+machine, measures 86 (44) / 37 (29) / 64 (41) fps single-threaded on
+the first, fourth and third 1080p rows and 28 (14) on the 2160p
+single-tile row — no native x86-64 hardware was measured.
 
 The decode path composes:
 
@@ -567,7 +603,16 @@ the dual-API convention:
   moves exactly at the first returned frame of a new shape (keyframe
   or intra-only resize, reference-scaled inter frame, a §8.9
   re-display of a differently-sized slot, the first frame after a
-  `reset( )`), identically at every thread budget. Since round 448 [`Vp9Decoder`]
+  `reset( )`), identically at every thread budget. Each move hands
+  out ONE `Frame::StreamParams` event from `receive_frame( )` just
+  ahead of that frame — payload equal to `output_params( )`, the
+  counter already moved, never for the first shape; hidden
+  (`show_frame = 0`) frames never place it, so it precedes the first
+  SHOWN frame of the new shape, after every queued frame of the old
+  one, also while draining after `flush( )` and after a `reset( )`.
+  The encoder accepts an event restating its configured input shape
+  and rejects any other with `Unsupported` (no mid-stream
+  re-configuration). Since round 448 [`Vp9Decoder`]
   honors the framework `set_execution_context` hook: multi-tile
   streams decode tile-parallel under the granted budget,
   frame-identical to the serial decode, with the budget preserved
@@ -900,9 +945,16 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
     [`Vp9GopConfig::adaptive_group_length`] halves alt-ref groups on
     fast motion (+0.06…+1.04 dB across the shapes / formats; static
     and intra-only GOPs byte-identical);
-  * the two-pass first pass is still one extra full encode at a fixed
-    probe quantizer (no downscaled / partial first pass), and the
-    allocation stays first-pass-size proportional (no explicit
+  * ~~the two-pass first pass is one extra full encode~~ — **round
+    486 adds [`encode_vp9_lossy_sequence_rc_two_pass_half_size_first_pass`]**
+    on the plain 4:2:0 chain: the probe chain codes the frames at half
+    size on both axes (2x2 means), the second pass is unchanged. On a
+    352x288 eight-frame GOP the first pass drops from 1.59 s to 0.49 s
+    (two-pass overhead over one-pass 26 % → 8 %); the stream stays at
+    99.9 % of the pool and within 0.13–0.25 dB of the full-size plan
+    on the test GOPs. The structured-GOP two-pass entries still run
+    the full-size first pass, the probe quantizer is still fixed, and
+    the allocation stays first-pass-size proportional (no explicit
     per-frame quality targeting);
   * ~~structured-GOP / resized entries public at 8-bit 4:2:0 only~~ —
     **round 455 lands the format-matrix wrappers**:
@@ -985,7 +1037,12 @@ every §8.5.1 intra mode against flat-preservation + `Clip1`-bound
 properties. A `cargo-fuzz` harness lives in `fuzz/` with panic-surface
 targets over the header parsers, the Boolean-decoder walkers, the whole
 `decode_frame` pipeline (single-frame, Annex B split, and the multi-frame
-sequence driver), the `encode_keyframe` encode → decode round-trip,
+sequence driver), the `decode_tile_parallel_diff` and
+`decode_frame_threads_diff` **differential** targets (serial against
+threaded decodes of arbitrary input — the batch API at 4 threads, and
+the framework decoder with frames in flight at 2..=9 threads — must
+agree on every frame and on whether an error is reported), the
+`encode_keyframe` encode → decode round-trip,
 the `encode_lossy_keyframe` **oracle-carrying** round-trip (a stream the
 lossy encoder emitted — elected §8.8 filter included — MUST decode), and
 the `encode_chained_sequence` round-trip carrying the **full lossless

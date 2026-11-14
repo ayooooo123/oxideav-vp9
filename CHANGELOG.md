@@ -6,6 +6,150 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+- `Default` on `Vp9DecodedFrame`; `with_<field>` setters on `Vp9EncoderOptions` and `Vp9DecodedFrame`.
+
+### Changed
+
+- API hygiene: `Error`, `Vp9EncoderOptions` and `Vp9DecodedFrame` are now `#[non_exhaustive]`. The §6/§7 syntax and loop-filter internals were already `#[doc(hidden)]`.
+
+### Fixed
+
+- Framework `Vp9Decoder` under a multi-thread budget, a frame failing
+  while later frames are in flight: the packet being submitted when the
+  failure surfaced was dropped instead of decoded (a keyframe right
+  behind a damaged frame was lost, and every frame of its group with
+  it), and frames completed on the way stayed queued inside the
+  decoder when no later packet succeeded. The submitted frame is now
+  decoded on the state the failing frame left — exactly what a serial
+  decode does — and completed frames are collected before the error is
+  returned. Found by the new `decode_frame_threads_diff` fuzz target
+  (serial vs 2..=9-thread `Vp9Decoder` over packet lists: identical
+  shown frames, `pts`, stream-params placement, and error presence);
+  pinned by a truncated-frame + keyframe-group test at 2 / 3 / 4 / 8
+  threads.
+
+- §8.5.2.4 inter prediction from a reference slot holding deeper
+  samples than the current frame (an 8-bit intra-only frame followed
+  by an inter frame that still references a 10/12-bit slot): the block
+  now runs the spec-literal two-pass form, so `Clip1` applies in both
+  passes — the whole-sample shortcut used to copy the deeper samples
+  through unclipped.
+
+### Added
+
+- `encode_vp9_lossy_sequence_rc_two_pass_half_size_first_pass`: the
+  two-pass chain with its first pass run over the frames at half size
+  on both axes (rounded 2x2 means) — a quarter of the samples to plan,
+  search and code; the second pass (allocation, VBV model, per-frame
+  bisection at full size) is unchanged. First pass 1.59 s → 0.49 s on
+  a 352x288 eight-frame GOP; 99.9 % of the pool, within 0.13–0.25 dB
+  of the full-size plan on the test GOPs. Sequences under 32 luma
+  samples on an axis take the full-size first pass.
+- `benches/decode_sweep.sh`: regenerates the 1080p / 2160p decode
+  benchmark streams with a black-box encoder, checks the output of
+  every thread budget against a black-box decode, and prints the fps
+  table (the README's "Decode speed" table).
+
+### Performance
+
+- Decode speed, 120-frame streams, same machine before → after
+  (fps): 1080p 8-bit single-tile 85 → 149 on one thread and 263 → 765
+  on eight; 1080p 10-bit 4-tile 76 → 127 / 415 → 711; 2160p 8-bit
+  single-tile 25 → 43 / 80 → 231; 2160p 8-bit 8-tile 21 → 36 /
+  136 → 206. A strict SSE2-only x86-64 build under binary translation:
+  44 → 86 fps single-threaded on the first stream. Output
+  byte-identical at every thread budget.
+- §8.5.2.4 inter prediction: each row of the horizontal / vertical pass
+  is eight multiply-accumulate sweeps (tap loop outermost) instead of a
+  per-sample eight-tap sum, the intermediate rows are `u16`, and 8-bit
+  streams accumulate on wrapping 16-bit lanes (a bias lifts every
+  reachable sum into `0..=65535`, pinned per kernel) in fixed-width
+  column groups whose accumulators stay in registers; deeper streams
+  use widening 16 x 16 -> 32 multiplies. Output unchanged.
+- §8.7 inverse transform: non-lossless blocks run both passes on
+  32-bit lanes (every row, then every column, of the block at once per
+  butterfly). The lanes are exact while every stored value fits 16
+  bits; a range flag folded over every stored value proves it per
+  block, and a block that trips it is evaluated by the 64-bit form
+  from its untouched input — so the result is the 64-bit one for any
+  input. Rows below the last non-zero row are left out of the row pass.
+- §8.6.2 reconstruction reads the logged `(position, token)` pairs
+  directly (no dense `Tokens[ ]` / `Dequant[ ]` round trip, no
+  per-entry division), with the DC-only block as a constant add.
+- §6.4.24 tokens: a block's symbols are read with the `BoolMaxBits`
+  test deferred to the end of the block (a tile that runs out fails
+  with the same error; pinned against the checked reads), the deep
+  token-tree nodes read a precomputed `pareto( )` table, and the
+  decoded tokens go straight into the reconstruction log; the
+  `ZERO_TOKEN` / `ONE_TOKEN` leaves are read in line.
+- §8.5.1 intra prediction keeps its edge and prediction arrays on the
+  stack (three heap allocations per transform block before).
+- Output frames are packed with fixed-length row loops (10/12-bit
+  streams: no per-sample growth check).
+- Threading, single-tile-column frames: the reconstruction job filters
+  each superblock row right after publishing it instead of handing it
+  to separate loop-filter jobs (which parked pool threads behind one
+  reconstruction job); the framework decoder keeps `1.5 x threads`
+  frames in flight (4..=8, was a fixed 4), so a stream without tile
+  columns keeps a larger budget busy through frame-level parallelism.
+  Output is byte-identical at every budget.
+- Retain the fork's returned-frame dimension hook over that same emitted
+  description. A reset keeps the last output shape so the first different
+  post-seek frame advances the generation instead of hiding the change.
+
+## [0.0.15](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.14...v0.0.15) - 2026-11-06
+
+### Other
+
+- Frame::StreamParams ahead of the first shown frame of a new shape
+- resized chain: a same-size frame scans its predecessor's motion field
+- :output_params + output_params_generation: emitted size, format and colour signal
+- the compressed-header kind feeds launch_single_frame
+- working planes store u16 samples; logged inter ops out of line
+- loop-filter decisions: per-cell block-edge masks, per-edge on-screen hoisting
+- the threading model (entropy-decode / reconstruction split, top-then-tail band freezing)
+- inter prediction: vertical-only filter straight from the reference rows, row-slice vertical pass
+- loop-filter kernel: separate horizontal / vertical instantiations with fixed tap ranges
+- loop filter kernel: batch up to 16 positions per call
+- tile columns split into entropy-decode and reconstruction jobs (logged pixel work, replayed in order)
+- rustfmt the frame-buffer pieces test
+- bands freeze top-then-tail: later frames start a superblock row sooner
+- token contexts from per-(size, type) neighbour tables; README: the threading model
+- inter prediction: edge-emulated unscaled footprints, no scale division for equal-size references
+- decoded frames store u16 samples (bands, references, output source)
+- loop filter: per-row resolved cells, per-level strength table, i16 lane kernel up to 10-bit
+- loop filter as three row-claiming jobs per frame, four frames in flight, direct inter prediction stores
+- frame threading: frames freeze finished rows, later frames read them as they land
+- persistent worker pool + superblock-row pipeline: tile columns publish rows, the loop filter follows
+- windowed boolean decoder, lazy token probabilities, no per-block token buffer refills
+- decoder hot paths: lane-parallel loop filter, direct inter prediction, flattened inverse transform
+
+### Added
+
+- `Vp9Decoder::receive_frame` emits `Frame::StreamParams` (oxideav-core
+  0.1.43) exactly where `output_params_generation` moves: one event,
+  payload equal to `output_params()`, immediately before the first
+  SHOWN frame of a new shape — a keyframe at a new size / profile /
+  bit depth / subsampling, an intra-only frame, a reference-scaled
+  inter frame (`frame_size_with_refs` / explicit §7.2.5 size), a §8.9
+  `show_existing_frame` re-display of a differently-shaped slot.
+  Hidden frames never place it; the decision is taken in output order,
+  so the call sequence is identical at 1 / 2 / 3 / 4 / 8 threads. None
+  for constant streams or the first shape; the same rule holds while
+  draining after `flush()` and after `reset()`. The comparison is
+  against the current `output_params()` answer (before the first frame:
+  the keyframe-header announcement), so events and generation bumps
+  correspond 1:1. Pinned by a hidden-keyframe + re-display stream
+  built from the black-box fixtures, the concatenated black-box
+  segments, the reference-scaled chain, and the staged corpus streams
+  with hidden alt-refs / superframes / intra-only frames / re-displays
+  / scaled references concatenated, plus an event-only consumer
+  (`OutputParamsWatch::observe_frame`) that tracks the stream without
+  polling the decoder.
+- `Vp9Encoder::send_frame` handles `Frame::StreamParams`: an event
+  restating the configured input shape is a no-op, any other shape is
+  `Unsupported` (the GOP engines do not re-configure mid-stream).
+
 - `Vp9Decoder` implements `Decoder::output_params` /
   `output_params_generation` (oxideav-core 0.1.42) and forwards
   `output_pixel_format` to it: emitted width / height (§7.2.5
@@ -19,15 +163,23 @@ All notable changes to `oxideav-vp9` are recorded here.
   against ffprobe across 8/10/12-bit, 4:2:0/4:2:2/4:4:0/4:4:4, RGB,
   odd sizes and signalled colour spaces.
 
+### Fixed
+
+- `encode_vp9_lossy_sequence_resized*`: a frame that keeps its
+  predecessor's size inside a resized chain now scans the
+  predecessor's motion field. The decoder derives §7.2.6
+  `UsePrevFrameMvs = 1` there (shown, same-sized, non-error-resilient
+  predecessor), and the writer modelled it as 0, so e.g. 64x48 → 32x24
+  → 32x24 produced a frame that failed the §9.2.3 padding check (and
+  decoded to garbage in a black-box decoder: 9.3 dB, now 37.3 dB).
+  Streams whose every frame changes size are byte-identical.
+
 ### Changed
 
 - A `CS_RGB` stream is labelled `Gbrp8` / `Gbrp10Le` / `Gbrp12Le`
   (planes G, B, R) instead of the `Yuv444P*` family;
   `Vp9Decoder::pixel_format( )` now describes the frame most recently
   returned (before the first: the first keyframe submitted).
-- Retain the fork's returned-frame dimension hook over that same emitted
-  description. A reset keeps the last output shape so the first different
-  post-seek frame advances the generation instead of hiding the change.
 
 ### Performance
 

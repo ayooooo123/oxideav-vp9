@@ -78,7 +78,7 @@ use crate::partition::{
     LeafSink, PartitionContextState, PartitionProbsKind, decode_partition, get_tile_offset,
     tile_payload_sizes,
 };
-use crate::reconstruct::{reconstruct_block, reconstruct_sparse, tx_type_for_intra};
+use crate::reconstruct::{reconstruct_block, tx_type_for_intra};
 use crate::ref_buffer::{REFS_PER_FRAME, RefBuffers};
 use crate::residual::{
     BLOCK_8X8, BLOCK_64X64, BLOCK_INVALID, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
@@ -98,7 +98,8 @@ use crate::worker_pool::{Batch, Job, WorkerPool};
 /// `width x height`; each chroma plane spans
 /// `((width + subsampling_x) >> subsampling_x) x
 /// ((height + subsampling_y) >> subsampling_y)` per §8.10.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Vp9DecodedFrame {
     /// `FrameWidth` per §7.2.5.
     pub width: u32,
@@ -116,6 +117,64 @@ pub struct Vp9DecodedFrame {
     pub u: Vec<u16>,
     /// Decoded V chroma plane (§8.10 subsampled extent).
     pub v: Vec<u16>,
+}
+
+impl Vp9DecodedFrame {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `bit_depth`.
+    #[must_use]
+    pub fn with_bit_depth(mut self, v: u8) -> Self {
+        self.bit_depth = v;
+        self
+    }
+
+    /// Set `subsampling_x`.
+    #[must_use]
+    pub fn with_subsampling_x(mut self, v: bool) -> Self {
+        self.subsampling_x = v;
+        self
+    }
+
+    /// Set `subsampling_y`.
+    #[must_use]
+    pub fn with_subsampling_y(mut self, v: bool) -> Self {
+        self.subsampling_y = v;
+        self
+    }
+
+    /// Set `y`.
+    #[must_use]
+    pub fn with_y(mut self, v: Vec<u16>) -> Self {
+        self.y = v;
+        self
+    }
+
+    /// Set `u`.
+    #[must_use]
+    pub fn with_u(mut self, v: Vec<u16>) -> Self {
+        self.u = v;
+        self
+    }
+
+    /// Set `v`.
+    #[must_use]
+    pub fn with_v(mut self, v: Vec<u16>) -> Self {
+        self.v = v;
+        self
+    }
 }
 
 use crate::loop_filter::{DEFAULT_LOOP_FILTER_MODE_DELTAS, DEFAULT_LOOP_FILTER_REF_DELTAS};
@@ -464,8 +523,6 @@ impl BlockDecoder<'_> {
                                 tx_type_for_intra(mode)
                             };
                             let scan = get_scan(plane, tx_sz, tx_type);
-                            let n0 = 1usize << (tx_sz + 2);
-                            let seg_eob = n0 * n0;
 
                             let tbc = TokenBlockCtx {
                                 plane,
@@ -481,17 +538,7 @@ impl BlockDecoder<'_> {
                             // neighbour precedes its position in the scan
                             // (pinned by a tokens.rs unit test), so only
                             // this block's own entries are read.
-                            let eob = tokens_eob(
-                                coder,
-                                &tbc,
-                                tx_sz,
-                                scan,
-                                &self.chdr.coef_probs,
-                                &self.nz[plane],
-                                &mut self.token_cache[..],
-                                &mut self.tok_buf[..seg_eob],
-                                self.counts,
-                            )?;
+                            let (eob, logged) = self.read_tokens(coder, &tbc, tx_sz, scan)?;
                             nonzero = eob > 0;
                             // §6.4.24: EobTotal += nonzero.
                             eob_total += u32::from(nonzero);
@@ -513,6 +560,7 @@ impl BlockDecoder<'_> {
                                     },
                                     scan,
                                     eob,
+                                    logged,
                                 );
                             }
                         }
@@ -955,8 +1003,6 @@ impl BlockDecoder<'_> {
                                 tx_type_for_intra(mode)
                             };
                             let scan = get_scan(plane, tx_sz, tx_type);
-                            let n0 = 1usize << (tx_sz + 2);
-                            let seg_eob = n0 * n0;
 
                             let tbc = TokenBlockCtx {
                                 plane,
@@ -972,17 +1018,7 @@ impl BlockDecoder<'_> {
                             // neighbour precedes its position in the scan
                             // (pinned by a tokens.rs unit test), so only
                             // this block's own entries are read.
-                            let eob = tokens_eob(
-                                coder,
-                                &tbc,
-                                tx_sz,
-                                scan,
-                                &self.chdr.coef_probs,
-                                &self.nz[plane],
-                                &mut self.token_cache[..],
-                                &mut self.tok_buf[..seg_eob],
-                                self.counts,
-                            )?;
+                            let (eob, logged) = self.read_tokens(coder, &tbc, tx_sz, scan)?;
                             nonzero = eob > 0;
                             eob_total += u32::from(nonzero);
 
@@ -1004,6 +1040,7 @@ impl BlockDecoder<'_> {
                                     },
                                     scan,
                                     eob,
+                                    logged,
                                 );
                             }
                         }
@@ -1109,23 +1146,64 @@ impl BlockDecoder<'_> {
         }
     }
 
-    /// §8.6.2 `reconstruct( )` of one transform block whose `Tokens[ ]`
-    /// (the first `eob` positions of `scan`) are in `tok_buf` — run now
-    /// or logged with its coefficients; either way `tok_buf` is left
-    /// all-zero.
-    fn px_recon(&mut self, mut op: ReconOp, scan: &[u16], eob: usize) {
-        let n0 = 1usize << (op.tx_sz + 2);
+    /// §6.4.24 `tokens( )` of one transform block. Returns `eob` and,
+    /// when the pixel work is logged, the block's non-zero `( position,
+    /// token )` range in the log's arena (the tokens go straight there);
+    /// otherwise the tokens are in `tok_buf`.
+    fn read_tokens(
+        &mut self,
+        coder: &mut BoolCoder<'_>,
+        tbc: &TokenBlockCtx,
+        tx_sz: u32,
+        scan: &[u16],
+    ) -> Result<(usize, (u32, u32)), Error> {
         match &mut self.sink {
             Sink::Log(log) => {
                 let start = log.coefs.len();
-                for &p in &scan[..eob] {
-                    let v = self.tok_buf[p as usize];
-                    if v != 0 {
-                        log.coefs.push((p, v as i32));
-                        self.tok_buf[p as usize] = 0;
-                    }
-                }
-                op.coefs = (start as u32, (log.coefs.len() - start) as u32);
+                let coefs = &mut log.coefs;
+                let eob = crate::tokens::tokens_eob_with(
+                    coder,
+                    tbc,
+                    tx_sz,
+                    scan,
+                    &self.chdr.coef_probs,
+                    &self.nz[tbc.plane],
+                    &mut self.token_cache[..],
+                    self.counts,
+                    |pos, v| {
+                        if v != 0 {
+                            coefs.push((pos as u16, v));
+                        }
+                    },
+                )?;
+                Ok((eob, (start as u32, (coefs.len() - start) as u32)))
+            }
+            Sink::Now { .. } => {
+                let eob = tokens_eob(
+                    coder,
+                    tbc,
+                    tx_sz,
+                    scan,
+                    &self.chdr.coef_probs,
+                    &self.nz[tbc.plane],
+                    &mut self.token_cache[..],
+                    &mut self.tok_buf[..scan.len()],
+                    self.counts,
+                )?;
+                Ok((eob, (0, 0)))
+            }
+        }
+    }
+
+    /// §8.6.2 `reconstruct( )` of one transform block whose `Tokens[ ]`
+    /// (the first `eob` positions of `scan`) [`Self::read_tokens`] just
+    /// read: run now from `tok_buf` (left all-zero), or logged with its
+    /// `logged` coefficient range.
+    fn px_recon(&mut self, mut op: ReconOp, scan: &[u16], eob: usize, logged: (u32, u32)) {
+        let n0 = 1usize << (op.tx_sz + 2);
+        match &mut self.sink {
+            Sink::Log(log) => {
+                op.coefs = logged;
                 log.ops.push(PixelOp::Recon(op));
             }
             Sink::Now { y, u, v, .. } => {
@@ -1335,7 +1413,7 @@ fn replay(
     ctx: &PixelCtx<'_>,
     planes: [&mut Plane; 3],
     pred: &mut crate::inter_pred::PredScratch,
-    _tok_buf: &mut [i64; 1024],
+    tok_buf: &mut [i64; 1024],
 ) {
     let [y, u, v] = planes;
     for op in &log.ops {
@@ -1364,13 +1442,13 @@ fn replay(
                     _ => &mut *v,
                 };
                 let (start, len) = (op.coefs.0 as usize, op.coefs.1 as usize);
-                let coefs = &log.coefs[start..start + len];
-                reconstruct_sparse(
+                crate::reconstruct::reconstruct_block_sparse(
                     dst,
                     usize::from(op.x),
                     usize::from(op.y),
                     u32::from(op.tx_sz),
-                    coefs,
+                    &log.coefs[start..start + len],
+                    tok_buf,
                     op.dc_quant,
                     op.ac_quant,
                     op.tx_type,
@@ -2158,6 +2236,14 @@ fn tile_recon_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool, 
         } = &mut scratch;
         replay(&log, &ctx, [&mut *y, &mut *u, &mut *v], pred, tok_buf);
         publish_tile_pixels(job, pipe, r, c0, c1, [y, u, v]);
+        // A lone tile column filters each superblock row as soon as it
+        // has published it (no separate loop-filter jobs — see
+        // `launch_frame`): the row and the row above are complete.
+        if job.tile_cols == 1
+            && let Some(lfp) = job.lf.as_ref()
+        {
+            loop_filter_row_job(lfp, pipe, (r / 8) as usize);
+        }
         log.clear();
         lock(scratch_pool).logs.push(log);
     }
@@ -2677,7 +2763,10 @@ fn launch_frame(
         );
         jobs.push(Box::new(move || tile_recon_job(&job, &pipe, &scratch, col)));
     }
-    if lf_on {
+    if lf_on && job.tile_cols > 1 {
+        // (A lone tile column filters its own rows as it publishes them:
+        // a waiting loop-filter job would hold a thread the next frames'
+        // jobs could use, for work that trails one reconstruction job.)
         // A few loop-filter jobs that claim superblock rows in order: a
         // waiting job holds its thread, so one job per row would park
         // most of the pool on rows not decoded yet (and keep the next
@@ -3326,11 +3415,19 @@ impl Vp9SequenceDecoder {
     ) -> Result<(), Error> {
         self.last_counts = None;
         // The bank this frame loads from may still owe the previous
-        // frame's backward adaptation.
-        self.resolve_adaptation()?;
+        // frame's backward adaptation. If an earlier frame turns out to
+        // have failed there, the state is the one that frame left and
+        // this frame is still decoded on it — as a serial decode, which
+        // reported the failure a call earlier, would — before the
+        // failure is returned.
+        let earlier = self.resolve_adaptation();
         let payload: Arc<[u8]> = Arc::from(frame);
-        let pending = self.start_frame(payload, tag)?;
-        self.inflight.push_back(pending);
+        match self.start_frame(payload, tag) {
+            Ok(pending) => self.inflight.push_back(pending),
+            // Both failed: the earlier frame's error is the one reported.
+            Err(e) => return Err(earlier.err().unwrap_or(e)),
+        }
+        earlier?;
         while self.inflight.len() > max_in_flight {
             self.complete_front()?;
         }

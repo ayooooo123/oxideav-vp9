@@ -261,17 +261,26 @@ fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(OutputShape, Fram
     );
     let (w, h) = (f.frame_width as usize, f.frame_height as usize);
     let pack = |p: usize, pw: usize, ph: usize| -> VideoPlane {
+        // Fixed-length row loops over a pre-sized buffer (no per-sample
+        // capacity check), so the narrowing / byte-pair store vectorises.
         if f.bit_depth == 8 {
-            let mut data = Vec::with_capacity(pw * ph);
-            for y in 0..ph {
-                data.extend(f.row(p, y)[..pw].iter().map(|&s| s as u8));
+            let mut data = vec![0u8; pw * ph];
+            if pw > 0 {
+                for (y, out) in data.chunks_exact_mut(pw).enumerate() {
+                    for (d, &s) in out.iter_mut().zip(&f.row(p, y)[..pw]) {
+                        *d = s as u8;
+                    }
+                }
             }
             VideoPlane { stride: pw, data }
         } else {
-            let mut data = Vec::with_capacity(pw * ph * 2);
-            for y in 0..ph {
-                for &s in &f.row(p, y)[..pw] {
-                    data.extend_from_slice(&s.to_le_bytes());
+            let mut data = vec![0u8; pw * ph * 2];
+            if pw > 0 {
+                for (y, out) in data.chunks_exact_mut(pw * 2).enumerate() {
+                    let (pairs, _) = out.as_chunks_mut::<2>();
+                    for (d, &s) in pairs.iter_mut().zip(&f.row(p, y)[..pw]) {
+                        *d = s.to_le_bytes();
+                    }
                 }
             }
             VideoPlane {
@@ -299,6 +308,19 @@ fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(OutputShape, Fram
 /// `show_existing_frame` behaves exactly like the corpus streams do
 /// under [`crate::decode_vp9_sequence`]. Shown frames queue for
 /// [`Self::receive_frame`] with the packet's `pts` attached.
+///
+/// VP9 may change its output shape on any frame — a keyframe at a new
+/// size / profile / bit depth / subsampling, an intra-only frame, or an
+/// inter frame coded at its own §7.2.5 size over §8.5.2.3 scaled
+/// references (`frame_size_with_refs( )`), and a §8.9
+/// `show_existing_frame` re-display of a differently-shaped slot.
+/// [`Self::receive_frame`] then returns ONE [`Frame::StreamParams`]
+/// event immediately before the first SHOWN frame of the new shape
+/// (hidden frames never move it; the decision is taken in output
+/// order, so it lands identically at every thread budget), with
+/// [`Decoder::output_params`] and [`Decoder::output_params_generation`]
+/// already moved and the event's payload equal to that answer. The
+/// first shape of a stream raises no event.
 #[derive(Debug)]
 pub struct Vp9Decoder {
     id: CodecId,
@@ -316,7 +338,10 @@ pub struct Vp9Decoder {
     /// submitted announces (cleared by [`Decoder::reset`]).
     announced: Option<OutputShape>,
     /// [`Decoder::output_params_generation`]: bumped (wrapping) when a
-    /// returned frame's description differs from the previous one's.
+    /// returned frame's description differs from the answer
+    /// [`Decoder::output_params`] gave before it — each bump hands out
+    /// exactly one [`Frame::StreamParams`] event, just ahead of that
+    /// frame.
     generation: u64,
     /// The caller-granted threading budget (framework contract: serial
     /// until `set_execution_context` says otherwise); forwarded to the
@@ -326,8 +351,20 @@ pub struct Vp9Decoder {
 }
 
 /// Frames the framework decoder keeps decoding concurrently under a
-/// multi-thread budget.
-const IN_FLIGHT: usize = 4;
+/// budget of `threads`: none serially (every frame completes within its
+/// packet), else one and a half per thread, at least 4 and at most 8.
+/// A frame's entropy decode and reconstruction are two jobs per tile
+/// column, each waiting on the frames before it only for the rows it
+/// reads, so a stream of single-tile frames keeps a thread busy only
+/// with that many frames open; the cap bounds the decoded frames held
+/// (and the output delay) at any budget.
+fn frames_in_flight(threads: usize) -> usize {
+    if threads > 1 {
+        (threads + threads / 2).clamp(4, 8)
+    } else {
+        0
+    }
+}
 
 /// The tag of a packet without a presentation timestamp.
 const NO_PTS: i64 = i64::MIN;
@@ -376,7 +413,6 @@ impl Vp9Decoder {
     }
 }
 
-
 impl Default for Vp9Decoder {
     fn default() -> Self {
         Self::new()
@@ -401,11 +437,11 @@ impl Decoder for Vp9Decoder {
         // §B.2 / §B.4: split the packet into its coded frames (a chunk
         // with no valid superframe index is a single coded frame — the
         // split is total, per the §B.4 fallback). Under a multi-thread
-        // budget up to `IN_FLIGHT` frames decode concurrently (each
+        // budget several frames ([`frames_in_flight`]) decode concurrently (each
         // frame's rows wait on the rows of the frames it reads), so a
         // shown frame may surface a couple of packets later; serially
         // every frame completes within its own packet.
-        let in_flight = if self.exec.threads > 1 { IN_FLIGHT } else { 0 };
+        let in_flight = frames_in_flight(self.exec.threads);
         let tag = packet.pts.unwrap_or(NO_PTS);
         let frames = split_superframe(&packet.data);
         for payload in frames {
@@ -414,8 +450,12 @@ impl Decoder for Vp9Decoder {
             if self.current.is_none() && self.announced.is_none() {
                 self.announced = OutputShape::of_keyframe(payload);
             }
-            self.seq.submit(payload, tag, in_flight).map_err(map_err)?;
+            // Frames a failing submit completed on the way (the ones
+            // ahead of the failing frame, and the ones replayed behind
+            // it) are output all the same.
+            let submitted = self.seq.submit(payload, tag, in_flight);
             self.collect_ready()?;
+            submitted.map_err(map_err)?;
         }
         Ok(())
     }
@@ -427,9 +467,25 @@ impl Decoder for Vp9Decoder {
                 // shape (a key / intra-only frame at a new size or
                 // format, a reference-scaled inter frame, a §8.9
                 // re-display of a differently-sized slot) — in output
-                // order, so identically at every thread budget.
-                if self.current.is_some_and(|c| c != shape) {
+                // order, so identically at every thread budget. Hidden
+                // (`show_frame == 0`) frames never reach the queue, so
+                // the change is announced at the first SHOWN frame of
+                // the new shape, never at the coded frame that
+                // introduced it. The comparison is against what
+                // `output_params` answers right now (the last returned
+                // frame, or before the first one the keyframe-header
+                // announcement), so the first shape raises no event.
+                if self.shape().is_some_and(|c| c != shape) {
+                    // Move the answer and the counter first, then hand
+                    // out ONE `StreamParams` event carrying exactly
+                    // that answer; the frame itself goes back to the
+                    // head of the queue and is returned by the next
+                    // call (its shape now equals `current`, so it
+                    // raises no second event).
                     self.generation = self.generation.wrapping_add(1);
+                    self.current = Some(shape);
+                    self.pending.push_front((f, shape));
+                    return Ok(Frame::StreamParams(Box::new(shape.to_params(&self.id))));
                 }
                 self.current = Some(shape);
                 return Ok(f);
@@ -439,8 +495,9 @@ impl Decoder for Vp9Decoder {
             }
             match self.seq.finish_one() {
                 Some(r) => {
-                    r.map_err(map_err)?;
+                    // As in `send_packet`: collect before reporting.
                     self.collect_ready()?;
+                    r.map_err(map_err)?;
                 }
                 None => return Err(CoreError::Eof),
             }
@@ -448,10 +505,10 @@ impl Decoder for Vp9Decoder {
     }
 
     fn output_video_dimensions(&self) -> Option<(u32, u32)> {
-        self.shape().map(|s| (s.width, s.height))
+        self.shape()
+            .map(|s| (s.width, s.height))
             .filter(|&(w, h)| w > 0 && h > 0)
     }
-
 
     fn flush(&mut self) -> CoreResult<()> {
         // Every frame submitted so far drains through receive_frame.
@@ -493,6 +550,7 @@ impl Decoder for Vp9Decoder {
 
 /// Typed options for [`Vp9Encoder`] (`CodecParameters::options`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Vp9EncoderOptions {
     /// §7.2.9 `base_q_idx` for every frame of the GOP (`1..=255`,
     /// smaller = higher quality). Ignored when `lossless` is set.
@@ -500,6 +558,22 @@ pub struct Vp9EncoderOptions {
     /// Lossless encode (§7.2.9 `Lossless == 1`: `base_q_idx == 0` with
     /// zero deltas — the §8.7.2 WHT path). Requires 8-bit 4:2:0 input.
     pub lossless: bool,
+}
+
+impl Vp9EncoderOptions {
+    /// Set `q`.
+    #[must_use]
+    pub fn with_q(mut self, v: u32) -> Self {
+        self.q = v;
+        self
+    }
+
+    /// Set `lossless`.
+    #[must_use]
+    pub fn with_lossless(mut self, v: bool) -> Self {
+        self.lossless = v;
+        self
+    }
 }
 
 impl Default for Vp9EncoderOptions {
@@ -687,6 +761,24 @@ impl Encoder for Vp9Encoder {
     }
 
     fn send_frame(&mut self, frame: &Frame) -> CoreResult<()> {
+        if let Some(p) = frame.stream_params() {
+            // The chain-framed GOP engines are sized at construction
+            // (frame buffers, §6.2.5 frame size, §7.2.2 colour config)
+            // and do not re-configure mid-stream. An event that
+            // restates the configured input shape changes nothing; any
+            // other shape is rejected.
+            let fmt = self.output.pixel_format;
+            let same = p.width.is_none_or(|w| w == self.width)
+                && p.height.is_none_or(|h| h == self.height)
+                && p.pixel_format.is_none_or(|f| Some(f) == fmt);
+            return if same {
+                Ok(())
+            } else {
+                Err(CoreError::unsupported(
+                    "vp9 encoder: mid-stream input shape change (StreamParams) is not supported",
+                ))
+            };
+        }
         let Frame::Video(v) = frame else {
             return Err(CoreError::invalid("vp9 encoder: expected a video frame"));
         };

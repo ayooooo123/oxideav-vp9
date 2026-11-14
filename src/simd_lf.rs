@@ -10,7 +10,7 @@
 ))]
 mod imp {
     use crate::adaptive_filter_strength::FilterStrength;
-    use crate::filter_size::{TX_16X16, TX_4X4};
+    use crate::filter_size::{TX_4X4, TX_16X16};
 
     #[cfg(target_arch = "aarch64")]
     mod vec16 {
@@ -30,9 +30,7 @@ mod imp {
             }
             #[inline(always)]
             pub unsafe fn load4(p: *const u16) -> Self {
-                Self(unsafe {
-                    vreinterpretq_s16_u16(vcombine_u16(vld1_u16(p), vdup_n_u16(0)))
-                })
+                Self(unsafe { vreinterpretq_s16_u16(vcombine_u16(vld1_u16(p), vdup_n_u16(0))) })
             }
             #[inline(always)]
             pub unsafe fn store8(self, p: *mut u16) {
@@ -395,7 +393,13 @@ mod imp {
             let wide = mask.and(flat);
             let mn = mask.andnot(wide);
             if !wide16 || !wide.any() {
-                (mn, wide, V16::splat(0), [V16::splat(0); 4], [V16::splat(0); 4])
+                (
+                    mn,
+                    wide,
+                    V16::splat(0),
+                    [V16::splat(0); 4],
+                    [V16::splat(0); 4],
+                )
             } else {
                 // Load outer p7..p4 and q4..q7 ONLY when wide16 AND at least one lane is flat!
                 let (olo, ohi): ([V16; 4], [V16; 4]) = if HORIZONTAL {
@@ -439,7 +443,10 @@ mod imp {
                     });
                     let tlo = V16::transpose8(rows_lo);
                     let thi = V16::transpose8(rows_hi);
-                    ([tlo[0], tlo[1], tlo[2], tlo[3]], [thi[0], thi[1], thi[2], thi[3]])
+                    (
+                        [tlo[0], tlo[1], tlo[2], tlo[3]],
+                        [thi[0], thi[1], thi[2], thi[3]],
+                    )
                 };
                 let flat2 = olo[0]
                     .abs_diff(p0)
@@ -579,25 +586,115 @@ mod imp {
         }
         let base = data.as_mut_ptr();
         match (along == 1, n) {
-            (true, 8) => filter_chunk8::<true, false>(base, q0, step, along, strength, filter_size, bit_depth),
+            (true, 8) => filter_chunk8::<true, false>(
+                base,
+                q0,
+                step,
+                along,
+                strength,
+                filter_size,
+                bit_depth,
+            ),
             (true, 16) => {
-                filter_chunk8::<true, false>(base, q0, step, along, strength, filter_size, bit_depth);
-                filter_chunk8::<true, false>(base, q0 + 8, step, along, strength, filter_size, bit_depth);
+                filter_chunk8::<true, false>(
+                    base,
+                    q0,
+                    step,
+                    along,
+                    strength,
+                    filter_size,
+                    bit_depth,
+                );
+                filter_chunk8::<true, false>(
+                    base,
+                    q0 + 8,
+                    step,
+                    along,
+                    strength,
+                    filter_size,
+                    bit_depth,
+                );
             }
-            (true, 4) => filter_chunk8::<true, true>(base, q0, step, along, strength, filter_size, bit_depth),
+            (true, 4) => {
+                filter_chunk8::<true, true>(base, q0, step, along, strength, filter_size, bit_depth)
+            }
             (true, 12) => {
-                filter_chunk8::<true, false>(base, q0, step, along, strength, filter_size, bit_depth);
-                filter_chunk8::<true, true>(base, q0 + 8, step, along, strength, filter_size, bit_depth);
+                filter_chunk8::<true, false>(
+                    base,
+                    q0,
+                    step,
+                    along,
+                    strength,
+                    filter_size,
+                    bit_depth,
+                );
+                filter_chunk8::<true, true>(
+                    base,
+                    q0 + 8,
+                    step,
+                    along,
+                    strength,
+                    filter_size,
+                    bit_depth,
+                );
             }
-            (false, 8) => filter_chunk8::<false, false>(base, q0, step, along, strength, filter_size, bit_depth),
+            (false, 8) => filter_chunk8::<false, false>(
+                base,
+                q0,
+                step,
+                along,
+                strength,
+                filter_size,
+                bit_depth,
+            ),
             (false, 16) => {
-                filter_chunk8::<false, false>(base, q0, step, along, strength, filter_size, bit_depth);
-                filter_chunk8::<false, false>(base, q0 + 8 * along, step, along, strength, filter_size, bit_depth);
+                filter_chunk8::<false, false>(
+                    base,
+                    q0,
+                    step,
+                    along,
+                    strength,
+                    filter_size,
+                    bit_depth,
+                );
+                filter_chunk8::<false, false>(
+                    base,
+                    q0 + 8 * along,
+                    step,
+                    along,
+                    strength,
+                    filter_size,
+                    bit_depth,
+                );
             }
-            (false, 4) => filter_chunk8::<false, true>(base, q0, step, along, strength, filter_size, bit_depth),
+            (false, 4) => filter_chunk8::<false, true>(
+                base,
+                q0,
+                step,
+                along,
+                strength,
+                filter_size,
+                bit_depth,
+            ),
             (false, 12) => {
-                filter_chunk8::<false, false>(base, q0, step, along, strength, filter_size, bit_depth);
-                filter_chunk8::<false, true>(base, q0 + 8 * along, step, along, strength, filter_size, bit_depth);
+                filter_chunk8::<false, false>(
+                    base,
+                    q0,
+                    step,
+                    along,
+                    strength,
+                    filter_size,
+                    bit_depth,
+                );
+                filter_chunk8::<false, true>(
+                    base,
+                    q0 + 8 * along,
+                    step,
+                    along,
+                    strength,
+                    filter_size,
+                    bit_depth,
+                );
             }
             _ => return false,
         }
@@ -617,7 +714,13 @@ mod imp {
 
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
-    pub fn convolve_h_u16_to_i16(row: &[u16], taps: &[i32; 8], max: i32, dst: &mut [i16], w: usize) {
+    pub fn convolve_h_u16_to_i16(
+        row: &[u16],
+        taps: &[i32; 8],
+        max: i32,
+        dst: &mut [i16],
+        w: usize,
+    ) {
         use core::arch::aarch64::*;
         let (ts, te) = tap_bounds(taps);
         let end8 = w & !7;
@@ -636,7 +739,10 @@ mod imp {
                 }
                 let r_lo = vmin_u16(vqmovun_s32(vshrq_n_s32::<7>(lo)), top);
                 let r_hi = vmin_u16(vqmovun_s32(vshrq_n_s32::<7>(hi)), top);
-                vst1q_s16(dst.as_mut_ptr().add(x), vreinterpretq_s16_u16(vcombine_u16(r_lo, r_hi)));
+                vst1q_s16(
+                    dst.as_mut_ptr().add(x),
+                    vreinterpretq_s16_u16(vcombine_u16(r_lo, r_hi)),
+                );
                 x += 8;
             }
             if end8 + 4 <= w {
@@ -662,7 +768,13 @@ mod imp {
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     #[inline(always)]
-    pub fn convolve_h_u16_to_i16(row: &[u16], taps: &[i32; 8], max: i32, dst: &mut [i16], w: usize) {
+    pub fn convolve_h_u16_to_i16(
+        row: &[u16],
+        taps: &[i32; 8],
+        max: i32,
+        dst: &mut [i16],
+        w: usize,
+    ) {
         use core::arch::wasm32::*;
         let (ts, te) = tap_bounds(taps);
         let end8 = w & !7;
@@ -682,7 +794,10 @@ mod imp {
                 }
                 let r_lo = i32x4_min(i32x4_max(i32x4_shr(lo, 7), zero), top);
                 let r_hi = i32x4_min(i32x4_max(i32x4_shr(hi, 7), zero), top);
-                v128_store(dst.as_mut_ptr().add(x).cast(), i16x8_narrow_i32x4(r_lo, r_hi));
+                v128_store(
+                    dst.as_mut_ptr().add(x).cast(),
+                    i16x8_narrow_i32x4(r_lo, r_hi),
+                );
                 x += 8;
             }
             if end8 + 4 <= w {
@@ -708,7 +823,13 @@ mod imp {
 
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
-    pub fn convolve_v_i16_to_u16(rows: [&[i16]; 8], taps: &[i32; 8], max: i32, dst: &mut [u16], w: usize) {
+    pub fn convolve_v_i16_to_u16(
+        rows: [&[i16]; 8],
+        taps: &[i32; 8],
+        max: i32,
+        dst: &mut [u16],
+        w: usize,
+    ) {
         use core::arch::aarch64::*;
         let (ts, te) = tap_bounds(taps);
         let end8 = w & !7;
@@ -751,7 +872,13 @@ mod imp {
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     #[inline(always)]
-    pub fn convolve_v_i16_to_u16(rows: [&[i16]; 8], taps: &[i32; 8], max: i32, dst: &mut [u16], w: usize) {
+    pub fn convolve_v_i16_to_u16(
+        rows: [&[i16]; 8],
+        taps: &[i32; 8],
+        max: i32,
+        dst: &mut [u16],
+        w: usize,
+    ) {
         use core::arch::wasm32::*;
         let (ts, te) = tap_bounds(taps);
         let end8 = w & !7;
@@ -770,7 +897,10 @@ mod imp {
                 }
                 let r_lo = i32x4_min(i32x4_max(i32x4_shr(lo, 7), zero), top);
                 let r_hi = i32x4_min(i32x4_max(i32x4_shr(hi, 7), zero), top);
-                v128_store(dst.as_mut_ptr().add(x).cast(), i16x8_narrow_i32x4(r_lo, r_hi));
+                v128_store(
+                    dst.as_mut_ptr().add(x).cast(),
+                    i16x8_narrow_i32x4(r_lo, r_hi),
+                );
                 x += 8;
             }
             if end8 + 4 <= w {
@@ -795,7 +925,13 @@ mod imp {
 
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
-    pub fn convolve_v_i16_to_i32(rows: [&[i16]; 8], taps: &[i32; 8], max: i32, dst: &mut [i32], w: usize) {
+    pub fn convolve_v_i16_to_i32(
+        rows: [&[i16]; 8],
+        taps: &[i32; 8],
+        max: i32,
+        dst: &mut [i32],
+        w: usize,
+    ) {
         use core::arch::aarch64::*;
         let (ts, te) = tap_bounds(taps);
         let end8 = w & !7;
@@ -812,8 +948,14 @@ mod imp {
                     lo = vmlal_n_s16(lo, vget_low_s16(v), t);
                     hi = vmlal_high_n_s16(hi, v, t);
                 }
-                vst1q_s32(dst.as_mut_ptr().add(x), vminq_s32(vmaxq_s32(vshrq_n_s32::<7>(lo), zero), top));
-                vst1q_s32(dst.as_mut_ptr().add(x + 4), vminq_s32(vmaxq_s32(vshrq_n_s32::<7>(hi), zero), top));
+                vst1q_s32(
+                    dst.as_mut_ptr().add(x),
+                    vminq_s32(vmaxq_s32(vshrq_n_s32::<7>(lo), zero), top),
+                );
+                vst1q_s32(
+                    dst.as_mut_ptr().add(x + 4),
+                    vminq_s32(vmaxq_s32(vshrq_n_s32::<7>(hi), zero), top),
+                );
                 x += 8;
             }
             if end8 + 4 <= w {
@@ -822,7 +964,10 @@ mod imp {
                     let v = vld1_s16(rows[k].as_ptr().add(end8));
                     acc = vmlal_n_s16(acc, v, taps[k] as i16);
                 }
-                vst1q_s32(dst.as_mut_ptr().add(end8), vminq_s32(vmaxq_s32(vshrq_n_s32::<7>(acc), zero), top));
+                vst1q_s32(
+                    dst.as_mut_ptr().add(end8),
+                    vminq_s32(vmaxq_s32(vshrq_n_s32::<7>(acc), zero), top),
+                );
                 x += 4;
             }
             for c in x..w {
@@ -837,7 +982,13 @@ mod imp {
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     #[inline(always)]
-    pub fn convolve_v_i16_to_i32(rows: [&[i16]; 8], taps: &[i32; 8], max: i32, dst: &mut [i32], w: usize) {
+    pub fn convolve_v_i16_to_i32(
+        rows: [&[i16]; 8],
+        taps: &[i32; 8],
+        max: i32,
+        dst: &mut [i32],
+        w: usize,
+    ) {
         use core::arch::wasm32::*;
         let (ts, te) = tap_bounds(taps);
         let end8 = w & !7;
@@ -854,8 +1005,14 @@ mod imp {
                     lo = i32x4_add(lo, i32x4_extmul_low_i16x8(v, tv[k]));
                     hi = i32x4_add(hi, i32x4_extmul_high_i16x8(v, tv[k]));
                 }
-                v128_store(dst.as_mut_ptr().add(x).cast(), i32x4_min(i32x4_max(i32x4_shr(lo, 7), zero), top));
-                v128_store(dst.as_mut_ptr().add(x + 4).cast(), i32x4_min(i32x4_max(i32x4_shr(hi, 7), zero), top));
+                v128_store(
+                    dst.as_mut_ptr().add(x).cast(),
+                    i32x4_min(i32x4_max(i32x4_shr(lo, 7), zero), top),
+                );
+                v128_store(
+                    dst.as_mut_ptr().add(x + 4).cast(),
+                    i32x4_min(i32x4_max(i32x4_shr(hi, 7), zero), top),
+                );
                 x += 8;
             }
             if end8 + 4 <= w {
@@ -864,7 +1021,10 @@ mod imp {
                     let v = v128_load64_zero(rows[k].as_ptr().add(end8).cast());
                     acc = i32x4_add(acc, i32x4_extmul_low_i16x8(v, tv[k]));
                 }
-                v128_store(dst.as_mut_ptr().add(end8).cast(), i32x4_min(i32x4_max(i32x4_shr(acc, 7), zero), top));
+                v128_store(
+                    dst.as_mut_ptr().add(end8).cast(),
+                    i32x4_min(i32x4_max(i32x4_shr(acc, 7), zero), top),
+                );
                 x += 4;
             }
             for c in x..w {
@@ -886,9 +1046,24 @@ mod imp {
             let one = vdupq_n_s32(1);
             while i + 8 <= n {
                 let cur = vld1q_u16(dst.as_ptr().add(i));
-                let lo = vshrq_n_s32::<1>(vaddq_s32(vaddq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(cur))), vld1q_s32(src.as_ptr().add(i))), one));
-                let hi = vshrq_n_s32::<1>(vaddq_s32(vaddq_s32(vreinterpretq_s32_u32(vmovl_high_u16(cur)), vld1q_s32(src.as_ptr().add(i + 4))), one));
-                vst1q_u16(dst.as_mut_ptr().add(i), vcombine_u16(vqmovun_s32(lo), vqmovun_s32(hi)));
+                let lo = vshrq_n_s32::<1>(vaddq_s32(
+                    vaddq_s32(
+                        vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(cur))),
+                        vld1q_s32(src.as_ptr().add(i)),
+                    ),
+                    one,
+                ));
+                let hi = vshrq_n_s32::<1>(vaddq_s32(
+                    vaddq_s32(
+                        vreinterpretq_s32_u32(vmovl_high_u16(cur)),
+                        vld1q_s32(src.as_ptr().add(i + 4)),
+                    ),
+                    one,
+                ));
+                vst1q_u16(
+                    dst.as_mut_ptr().add(i),
+                    vcombine_u16(vqmovun_s32(lo), vqmovun_s32(hi)),
+                );
                 i += 8;
             }
         }
@@ -906,8 +1081,26 @@ mod imp {
             let one = i32x4_splat(1);
             while i + 8 <= n {
                 let cur = v128_load(dst.as_ptr().add(i).cast());
-                let lo = i32x4_shr(i32x4_add(i32x4_add(u32x4_extend_low_u16x8(cur), v128_load(src.as_ptr().add(i).cast())), one), 1);
-                let hi = i32x4_shr(i32x4_add(i32x4_add(u32x4_extend_high_u16x8(cur), v128_load(src.as_ptr().add(i + 4).cast())), one), 1);
+                let lo = i32x4_shr(
+                    i32x4_add(
+                        i32x4_add(
+                            u32x4_extend_low_u16x8(cur),
+                            v128_load(src.as_ptr().add(i).cast()),
+                        ),
+                        one,
+                    ),
+                    1,
+                );
+                let hi = i32x4_shr(
+                    i32x4_add(
+                        i32x4_add(
+                            u32x4_extend_high_u16x8(cur),
+                            v128_load(src.as_ptr().add(i + 4).cast()),
+                        ),
+                        one,
+                    ),
+                    1,
+                );
                 v128_store(dst.as_mut_ptr().add(i).cast(), i16x8_narrow_i32x4(lo, hi));
                 i += 8;
             }
